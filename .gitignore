@@ -165,6 +165,9 @@ gateway-files/
 # Hummingbot credentials and local data
 bots/credentials/
 bots/instances/
+bots/archived/
+bots/conf/controllers/
+bots/conf/scripts/
 
 # Local MCP configuration (project-specific overrides)
 .mcp.json

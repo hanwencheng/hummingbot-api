@@ -1,0 +1,8 @@
+# Core dependencies for IDE/Cursor support
+fastapi
+uvicorn[standard]
+python-dotenv
+sqlalchemy>=2.0.0
+asyncpg
+pydantic-settings
+docker
