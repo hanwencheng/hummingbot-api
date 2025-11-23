@@ -11,7 +11,8 @@ from hummingbot.strategy_v2.executors.position_executor.data_types import Positi
 from hummingbot.strategy_v2.executors.order_executor.data_types import OrderExecutorConfig, ExecutionStrategy
 from hummingbot.strategy_v2.models.executor_actions import CreateExecutorAction, ExecutorAction, StopExecutorAction
 from hummingbot.strategy_v2.models.executors import CloseType
-from hummingbot.core.data_type.common import PriceType
+from hummingbot.core.data_type.common import PriceType, MarketDict
+from hummingbot.strategy_v2.executors.data_types import ConnectorPair
 
 class LevelGroup:
     """Represents a group of levels: accumulate, profit, and stop_loss"""
@@ -135,13 +136,19 @@ class StrategyControllerBase(ControllerBase):
         # This prevents interfering with connector initialization
 
         # Initialize market data provider (same as PMM strategy)
-        from hummingbot.strategy_v2.executors.data_types import ConnectorPair
         self.market_data_provider.initialize_rate_sources([
             ConnectorPair(
                 connector_name=config.connector_name,
                 trading_pair=config.trading_pair
             )
         ])
+
+    def update_markets(self, markets: MarketDict) -> MarketDict:
+        """
+        Update markets dictionary with the connector and trading pair this strategy needs.
+        This is required for the framework to initialize the necessary connectors.
+        """
+        return markets.add_or_update(self.config.connector_name, self.config.trading_pair)
 
     def _calculate_final_levels(self):
         """Calculate final profit and stop loss levels - to be overridden by subclasses"""
@@ -204,7 +211,17 @@ class StrategyControllerBase(ControllerBase):
 
         # Initialize start time and level groups on first call (after connector is ready)
         if self.strategy_start_time is None:
-            self.strategy_start_time = self.current_timestamp
+            # Check if connector is ready before initializing
+            connector = self.connectors.get(self.config.connector_name)
+            if connector is None:
+                # Connector not available yet, skip initialization this round
+                return actions
+
+            if not connector.ready:
+                # Connector not ready yet, skip initialization this round
+                return actions
+
+            self.strategy_start_time = self.market_data_provider.time()
             # Calculate final levels and initialize level groups now that connector is ready
             self._calculate_final_levels()
             self._initialize_level_groups()
@@ -232,13 +249,22 @@ class StrategyControllerBase(ControllerBase):
         Update the processed data for the controller.
         Gets current market price and position information.
         """
-
-        # Get current market price
-        reference_price = self.market_data_provider.get_price_by_type(
-            self.config.connector_name,
-            self.config.trading_pair,
-            PriceType.MidPrice
-        )
+        # Get current market price with fallback for when connector isn't ready
+        try:
+            reference_price = self.market_data_provider.get_price_by_type(
+                self.config.connector_name,
+                self.config.trading_pair,
+                PriceType.MidPrice
+            )
+        except (ValueError, AttributeError, KeyError) as e:
+            # Connector not ready yet, use entry price as fallback and return early
+            self.processed_data = {
+                "reference_price": self.config.entry_price,
+                "position_amount": Decimal("0"),
+                "unrealized_pnl_pct": Decimal("0"),
+                "current_timestamp": self.market_data_provider.time()
+            }
+            return
 
         # Get current position if any
         position_held = None
@@ -266,7 +292,7 @@ class StrategyControllerBase(ControllerBase):
             "reference_price": reference_price,
             "position_amount": position_amount,
             "unrealized_pnl_pct": unrealized_pnl_pct,
-            "current_timestamp": self.current_timestamp
+            "current_timestamp": self.market_data_provider.time()
         }
 
     def _get_current_price(self) -> Decimal:
@@ -287,7 +313,7 @@ class StrategyControllerBase(ControllerBase):
         """Check if strategy has exceeded time limit"""
         if self.strategy_start_time is None:
             return False
-        time_elapsed_hours = (self.current_timestamp - self.strategy_start_time) / 3600
+        time_elapsed_hours = (self.market_data_provider.time() - self.strategy_start_time) / 3600
         return time_elapsed_hours > self.config.time_limit
 
     def _check_final_levels_hit(self, current_price: Decimal) -> bool:
@@ -321,7 +347,7 @@ class StrategyControllerBase(ControllerBase):
         """Create limit order executor for accumulate level"""
         accumulate_level = level_group.accumulate_level
         executor_config = OrderExecutorConfig(
-            timestamp=self.current_timestamp,
+            timestamp=self.market_data_provider.time(),
             connector_name=self.config.connector_name,
             trading_pair=self.config.trading_pair,
             side=accumulate_level["side"],
@@ -343,7 +369,7 @@ class StrategyControllerBase(ControllerBase):
         """Create limit order executor for profit level"""
         profit_level = level_group.profit_level
         executor_config = OrderExecutorConfig(
-            timestamp=self.current_timestamp,
+            timestamp=self.market_data_provider.time(),
             connector_name=self.config.connector_name,
             trading_pair=self.config.trading_pair,
             side=profit_level["side"],
@@ -365,7 +391,7 @@ class StrategyControllerBase(ControllerBase):
         """Create market order executor for stop loss level - triggers immediately when stop loss hit"""
         stop_loss_level = level_group.stop_loss_level
         executor_config = OrderExecutorConfig(
-            timestamp=self.current_timestamp,
+            timestamp=self.market_data_provider.time(),
             connector_name=self.config.connector_name,
             trading_pair=self.config.trading_pair,
             side=stop_loss_level["side"],
@@ -436,3 +462,46 @@ class StrategyControllerBase(ControllerBase):
     def on_stop(self):
         """Clean up when controller stops"""
         self.strategy_active = False
+
+    def to_format_status(self) -> List[str]:
+        """
+        Get the status of the controller in a formatted way.
+        Returns strategy-specific information for level-based trading.
+        """
+        status = []
+
+        # Header
+        header = f"Strategy: {self.config.controller_name} | {self.config.connector_name}:{self.config.trading_pair}"
+        status.append(header)
+        status.append("=" * len(header))
+
+        # Basic strategy info
+        direction = "BUY" if self.config.direction_buy else "SELL"
+        status.append(f"Direction: {direction}")
+        status.append(f"Entry Price: {self.config.entry_price}")
+        status.append(f"Levels: {self.config.level_number}")
+        status.append(f"Level Size: {self.config.level_size}")
+        status.append(f"Level %: {self.config.level_pct:.2%}")
+        status.append("")
+
+        # Strategy state
+        if hasattr(self, 'strategy_start_time') and self.strategy_start_time:
+            elapsed = (self.market_data_provider.time() - self.strategy_start_time) / 3600
+            status.append(f"Running Time: {elapsed:.1f}h / {self.config.time_limit}h")
+        else:
+            status.append("Status: Initializing...")
+
+        status.append(f"Active: {self.strategy_active}")
+        status.append(f"Total Position: {self.total_accumulated_position}")
+        status.append("")
+
+        # Level group status
+        if hasattr(self, 'level_groups') and self.level_groups:
+            status.append("Level Groups Status:")
+            for i, lg in enumerate(self.level_groups):
+                acc_status = "✓" if lg.accumulate_active else "✗"
+                prof_status = "✓" if lg.profit_active else "✗"
+                stop_status = "✓" if lg.stop_loss_active else "✗"
+                status.append(f"  L{i}: Acc:{acc_status} Prof:{prof_status} Stop:{stop_status}")
+
+        return status

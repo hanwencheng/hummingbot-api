@@ -19,20 +19,10 @@ class DynamicQuickStopConfig(StrategyControllerConfigBase):
     controller_name: str = "strategy_dynamic_quick_stop"
     controller_type: str = "market_making"
 
-    def __init__(self, **data):
-        super().__init__(**data)
-        # Set strategy-specific parameters
-        direction_multiplier = 1 if self.direction_buy else -1
-
-        self.final_profit_level = self.entry_price * (
-            1 + direction_multiplier * self.level_number * self.level_pct
-        )
-        self.final_stop_loss_level = self.entry_price * (
-            1 - direction_multiplier * 2 * self.level_number * self.level_pct
-        )
-        self.accumulate_skew = Decimal("1")
-        self.profit_skew = Decimal("1")
-        self.stop_loss_skew = Decimal("0")
+    # Strategy-specific parameters (set in the strategy controller)
+    accumulate_skew: Decimal = Decimal("1")
+    profit_skew: Decimal = Decimal("1")
+    stop_loss_skew: Decimal = Decimal("0")
 
 
 class DynamicQuickStop(StrategyControllerBase):
@@ -65,10 +55,7 @@ class DynamicQuickStop(StrategyControllerBase):
             1 - direction_multiplier * 2 * self.config.level_number * self.config.level_pct
         )
 
-        # Ensure skews are set correctly
-        self.config.accumulate_skew = Decimal("1")
-        self.config.profit_skew = Decimal("1")
-        self.config.stop_loss_skew = Decimal("0")
+        # Strategy-specific skews are already set in config class defaults
 
     def determine_executor_actions(self) -> List[ExecutorAction]:
         """
