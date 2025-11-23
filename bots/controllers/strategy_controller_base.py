@@ -1,3 +1,4 @@
+import logging
 from decimal import Decimal
 from enum import Enum
 from typing import Dict, List, Optional, Union
@@ -116,6 +117,13 @@ class StrategyControllerConfigBase(ControllerConfigBase):
             raise ValueError("Percentage values must be between 0 and 1")
         return v
 
+    def update_markets(self, markets: MarketDict) -> MarketDict:
+        """
+        Update markets dictionary with the connector and trading pair this strategy needs.
+        This method in the config class is called during framework initialization.
+        """
+        return markets.add_or_update(self.connector_name, self.trading_pair)
+
 
 class StrategyControllerBase(ControllerBase):
     """
@@ -128,9 +136,11 @@ class StrategyControllerBase(ControllerBase):
         self.config = config
         self.level_groups: List[LevelGroup] = []
         self.strategy_start_time = None  # Will be set in first update cycle
-        self.strategy_active = True
         self.total_accumulated_position = Decimal("0")
         self.processed_data = {}  # Initialize processed data
+
+        # Use Hummingbot's logging system (no custom logger setup)
+        # The framework provides self.logger automatically
 
         # Initialize level groups - defer complex calculations until after connector is ready
         # This prevents interfering with connector initialization
@@ -142,13 +152,6 @@ class StrategyControllerBase(ControllerBase):
                 trading_pair=config.trading_pair
             )
         ])
-
-    def update_markets(self, markets: MarketDict) -> MarketDict:
-        """
-        Update markets dictionary with the connector and trading pair this strategy needs.
-        This is required for the framework to initialize the necessary connectors.
-        """
-        return markets.add_or_update(self.config.connector_name, self.config.trading_pair)
 
     def _calculate_final_levels(self):
         """Calculate final profit and stop loss levels - to be overridden by subclasses"""
@@ -192,7 +195,7 @@ class StrategyControllerBase(ControllerBase):
 
             # Calculate stop loss level
             stop_loss_price = self.config.final_stop_loss_level + (
-                (self.config.level_number - i + 1) * self.config.level_pct * self.config.entry_price *
+                (self.config.level_number - i - 1) * self.config.level_pct * self.config.entry_price *
                 direction_multiplier * self.config.stop_loss_skew
             )
             # Size calculation: level_size / price of accumulate_level * price of stop_loss_level
@@ -209,22 +212,24 @@ class StrategyControllerBase(ControllerBase):
         """Main strategy logic - determine what actions to take"""
         actions = []
 
-        # Initialize start time and level groups on first call (after connector is ready)
+        # Initialize start time and level groups on first call
         if self.strategy_start_time is None:
             self.strategy_start_time = self.market_data_provider.time()
-            # Calculate final levels and initialize level groups now that connector is ready
+            # Calculate final levels and initialize level groups
             self._calculate_final_levels()
             self._initialize_level_groups()
+            self.logger().info(f"self.config.final_profit_level:{self.config.final_profit_level} self.config.final_stop_loss_level{self.config.final_stop_loss_level}")
 
-        if not self.strategy_active:
-            return actions
-
+        self.logger().info(f"level groups: {self.level_groups}")
         # Check time limit
         if self._check_time_limit_exceeded():
             return self._close_all_positions_and_stop()
 
+    
         # Check final profit/stop loss levels
         current_price = self._get_current_price()
+        self.logger().info(f"current_price: {current_price}")
+        
         if self._check_final_levels_hit(current_price):
             return self._close_all_positions_and_stop()
 
@@ -319,6 +324,8 @@ class StrategyControllerBase(ControllerBase):
         """Manage a single level group"""
         actions = []
 
+        self.logger().info(f"level_group{level_group.level_index}: accumulate_active:{level_group.accumulate_active} accumulate_executor_id:{level_group.accumulate_executor_id}")
+
         # Check if accumulate level should be active and create executor if needed
         if level_group.accumulate_active and not level_group.accumulate_executor_id:
             actions.append(self._create_accumulate_executor(level_group))
@@ -328,14 +335,19 @@ class StrategyControllerBase(ControllerBase):
             actions.append(self._create_profit_executor(level_group))
 
         # Check if stop loss level should be active and create executor if needed
-        if level_group.stop_loss_active and not level_group.stop_loss_executor_id:
-            actions.append(self._create_stop_loss_executor(level_group))
+        # if level_group.stop_loss_active and not level_group.stop_loss_executor_id:
+            # actions.append(self._create_stop_loss_executor(level_group))
 
         return actions
 
     def _create_accumulate_executor(self, level_group: LevelGroup) -> CreateExecutorAction:
         """Create limit order executor for accumulate level"""
         accumulate_level = level_group.accumulate_level
+
+        self.logger().info(f"🏗️ Creating accumulate order - Level {level_group.level_index}: "
+                        f"Side={accumulate_level['side']}, Price={accumulate_level['price']}, "
+                        f"Size={accumulate_level['size']}")
+
         executor_config = OrderExecutorConfig(
             timestamp=self.market_data_provider.time(),
             connector_name=self.config.connector_name,
@@ -353,6 +365,7 @@ class StrategyControllerBase(ControllerBase):
         )
 
         level_group.accumulate_executor_id = action.executor_config.id
+        self.logger().info(f"✅ Accumulate executor created with ID: {action.executor_config.id}")
         return action
 
     def _create_profit_executor(self, level_group: LevelGroup) -> CreateExecutorAction:
@@ -365,6 +378,7 @@ class StrategyControllerBase(ControllerBase):
             side=profit_level["side"],
             amount=profit_level["size"],
             price=profit_level["price"],
+            leverage=10,
             execution_strategy=ExecutionStrategy.LIMIT,
             level_id=f"profit_{level_group.level_index}"
         )
@@ -402,7 +416,6 @@ class StrategyControllerBase(ControllerBase):
     def _close_all_positions_and_stop(self) -> List[ExecutorAction]:
         """Close all active positions and stop the strategy"""
         actions = []
-        self.strategy_active = False
 
         # Stop all active executors
         for level_group in self.level_groups:
@@ -449,10 +462,6 @@ class StrategyControllerBase(ControllerBase):
                 self.total_accumulated_position -= amount
                 break
 
-    def on_stop(self):
-        """Clean up when controller stops"""
-        self.strategy_active = False
-
     def to_format_status(self) -> List[str]:
         """
         Get the status of the controller in a formatted way.
@@ -481,7 +490,6 @@ class StrategyControllerBase(ControllerBase):
         else:
             status.append("Status: Initializing...")
 
-        status.append(f"Active: {self.strategy_active}")
         status.append(f"Total Position: {self.total_accumulated_position}")
         status.append("")
 
