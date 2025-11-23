@@ -211,16 +211,6 @@ class StrategyControllerBase(ControllerBase):
 
         # Initialize start time and level groups on first call (after connector is ready)
         if self.strategy_start_time is None:
-            # Check if connector is ready before initializing
-            connector = self.connectors.get(self.config.connector_name)
-            if connector is None:
-                # Connector not available yet, skip initialization this round
-                return actions
-
-            if not connector.ready:
-                # Connector not ready yet, skip initialization this round
-                return actions
-
             self.strategy_start_time = self.market_data_provider.time()
             # Calculate final levels and initialize level groups now that connector is ready
             self._calculate_final_levels()
