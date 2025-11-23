@@ -8,9 +8,10 @@ from hummingbot.data_feed.candles_feed.data_types import CandlesConfig
 from hummingbot.strategy_v2.controllers.controller_base import ControllerBase, ControllerConfigBase
 from hummingbot.strategy_v2.executors.data_types import ConnectorPair
 from hummingbot.strategy_v2.executors.position_executor.data_types import PositionExecutorConfig, TripleBarrierConfig
+from hummingbot.strategy_v2.executors.order_executor.data_types import OrderExecutorConfig, ExecutionStrategy
 from hummingbot.strategy_v2.models.executor_actions import CreateExecutorAction, ExecutorAction, StopExecutorAction
 from hummingbot.strategy_v2.models.executors import CloseType
-
+from hummingbot.core.data_type.common import PriceType
 
 class LevelGroup:
     """Represents a group of levels: accumulate, profit, and stop_loss"""
@@ -36,7 +37,7 @@ class StrategyControllerConfigBase(ControllerConfigBase):
 
     # Trading pair configuration
     connector_name: str = Field(
-        default="binance",
+        default="hyperliquid_perpetual",
         json_schema_extra={
             "prompt_on_new": True,
             "prompt": "Enter the name of the connector to use (e.g., binance):",
@@ -128,12 +129,19 @@ class StrategyControllerBase(ControllerBase):
         self.strategy_start_time = None  # Will be set in first update cycle
         self.strategy_active = True
         self.total_accumulated_position = Decimal("0")
+        self.processed_data = {}  # Initialize processed data
 
-        # Calculate final levels based on strategy type
-        self._calculate_final_levels()
+        # Initialize level groups - defer complex calculations until after connector is ready
+        # This prevents interfering with connector initialization
 
-        # Initialize level groups
-        self._initialize_level_groups()
+        # Initialize market data provider (same as PMM strategy)
+        from hummingbot.strategy_v2.executors.data_types import ConnectorPair
+        self.market_data_provider.initialize_rate_sources([
+            ConnectorPair(
+                connector_name=config.connector_name,
+                trading_pair=config.trading_pair
+            )
+        ])
 
     def _calculate_final_levels(self):
         """Calculate final profit and stop loss levels - to be overridden by subclasses"""
@@ -165,8 +173,9 @@ class StrategyControllerBase(ControllerBase):
 
             # Calculate profit level
             profit_price = self.config.final_profit_level - (
-                i * self.config.level_pct * self.config.entry_price *  direction_multiplier * self.config.profit_skew
+                i * self.config.level_pct * self.config.entry_price * direction_multiplier * self.config.profit_skew
             )
+            # Size calculation: level_size / price of accumulate_level * price of profit_level
             profit_size = self.config.level_size / accumulate_price * profit_price
             level_group.profit_level = {
                 "price": profit_price,
@@ -179,6 +188,7 @@ class StrategyControllerBase(ControllerBase):
                 (self.config.level_number - i + 1) * self.config.level_pct * self.config.entry_price *
                 direction_multiplier * self.config.stop_loss_skew
             )
+            # Size calculation: level_size / price of accumulate_level * price of stop_loss_level
             stop_loss_size = self.config.level_size / accumulate_price * stop_loss_price
             level_group.stop_loss_level = {
                 "price": stop_loss_price,
@@ -192,9 +202,12 @@ class StrategyControllerBase(ControllerBase):
         """Main strategy logic - determine what actions to take"""
         actions = []
 
-        # Initialize start time on first call
+        # Initialize start time and level groups on first call (after connector is ready)
         if self.strategy_start_time is None:
             self.strategy_start_time = self.current_timestamp
+            # Calculate final levels and initialize level groups now that connector is ready
+            self._calculate_final_levels()
+            self._initialize_level_groups()
 
         if not self.strategy_active:
             return actions
@@ -214,12 +227,60 @@ class StrategyControllerBase(ControllerBase):
 
         return actions
 
+    async def update_processed_data(self):
+        """
+        Update the processed data for the controller.
+        Gets current market price and position information.
+        """
+
+        # Get current market price
+        reference_price = self.market_data_provider.get_price_by_type(
+            self.config.connector_name,
+            self.config.trading_pair,
+            PriceType.MidPrice
+        )
+
+        # Get current position if any
+        position_held = None
+        if hasattr(self, 'positions_held') and self.positions_held:
+            position_held = next(
+                (position for position in self.positions_held if
+                 position.trading_pair == self.config.trading_pair and
+                 position.connector_name == self.config.connector_name),
+                None
+            )
+
+        # Calculate position metrics
+        if position_held is not None:
+            position_amount = position_held.amount
+            unrealized_pnl_pct = (
+                position_held.unrealized_pnl_quote / position_held.amount_quote
+                if position_held.amount_quote != 0 else Decimal("0")
+            )
+        else:
+            position_amount = Decimal("0")
+            unrealized_pnl_pct = Decimal("0")
+
+        # Update processed data
+        self.processed_data = {
+            "reference_price": reference_price,
+            "position_amount": position_amount,
+            "unrealized_pnl_pct": unrealized_pnl_pct,
+            "current_timestamp": self.current_timestamp
+        }
+
     def _get_current_price(self) -> Decimal:
         """Get current market price"""
+        # Try to get from processed data first
+        if self.processed_data and "reference_price" in self.processed_data:
+            return Decimal(str(self.processed_data["reference_price"]))
+
+        # Fallback to direct connector access
         connector = self.connectors.get(self.config.connector_name)
         if connector and connector.ready:
             mid_price = connector.get_mid_price(self.config.trading_pair)
             return Decimal(str(mid_price))
+
         return self.config.entry_price
 
     def _check_time_limit_exceeded(self) -> bool:
@@ -257,21 +318,17 @@ class StrategyControllerBase(ControllerBase):
         return actions
 
     def _create_accumulate_executor(self, level_group: LevelGroup) -> CreateExecutorAction:
-        """Create executor for accumulate level"""
+        """Create limit order executor for accumulate level"""
         accumulate_level = level_group.accumulate_level
-        executor_config = PositionExecutorConfig(
+        executor_config = OrderExecutorConfig(
             timestamp=self.current_timestamp,
             connector_name=self.config.connector_name,
             trading_pair=self.config.trading_pair,
             side=accumulate_level["side"],
-            amount_quote=accumulate_level["size"],
-            entry_price=accumulate_level["price"],
-            triple_barrier_config=TripleBarrierConfig(
-                take_profit=None,
-                stop_loss=None,
-                trailing_stop=None,
-                time_limit=None
-            )
+            amount=accumulate_level["size"],
+            price=accumulate_level["price"],
+            execution_strategy=ExecutionStrategy.LIMIT,
+            level_id=f"accumulate_{level_group.level_index}"
         )
 
         action = CreateExecutorAction(
@@ -283,21 +340,17 @@ class StrategyControllerBase(ControllerBase):
         return action
 
     def _create_profit_executor(self, level_group: LevelGroup) -> CreateExecutorAction:
-        """Create executor for profit level"""
+        """Create limit order executor for profit level"""
         profit_level = level_group.profit_level
-        executor_config = PositionExecutorConfig(
+        executor_config = OrderExecutorConfig(
             timestamp=self.current_timestamp,
             connector_name=self.config.connector_name,
             trading_pair=self.config.trading_pair,
             side=profit_level["side"],
-            amount_quote=profit_level["size"],
-            entry_price=profit_level["price"],
-            triple_barrier_config=TripleBarrierConfig(
-                take_profit=None,
-                stop_loss=None,
-                trailing_stop=None,
-                time_limit=None
-            )
+            amount=profit_level["size"],
+            price=profit_level["price"],
+            execution_strategy=ExecutionStrategy.LIMIT,
+            level_id=f"profit_{level_group.level_index}"
         )
 
         action = CreateExecutorAction(
@@ -309,21 +362,17 @@ class StrategyControllerBase(ControllerBase):
         return action
 
     def _create_stop_loss_executor(self, level_group: LevelGroup) -> CreateExecutorAction:
-        """Create executor for stop loss level"""
+        """Create market order executor for stop loss level - triggers immediately when stop loss hit"""
         stop_loss_level = level_group.stop_loss_level
-        executor_config = PositionExecutorConfig(
+        executor_config = OrderExecutorConfig(
             timestamp=self.current_timestamp,
             connector_name=self.config.connector_name,
             trading_pair=self.config.trading_pair,
             side=stop_loss_level["side"],
-            amount_quote=stop_loss_level["size"],
-            entry_price=stop_loss_level["price"],
-            triple_barrier_config=TripleBarrierConfig(
-                take_profit=None,
-                stop_loss=None,
-                trailing_stop=None,
-                time_limit=None
-            )
+            amount=stop_loss_level["size"],
+            price=stop_loss_level["price"],
+            execution_strategy=ExecutionStrategy.MARKET,  # Stop loss should be market order
+            level_id=f"stop_loss_{level_group.level_index}"
         )
 
         action = CreateExecutorAction(
