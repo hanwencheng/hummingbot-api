@@ -217,12 +217,11 @@ class StrategyControllerBase(ControllerBase):
         if self._check_time_limit_exceeded():
             return self._close_all_positions_and_stop()
 
-    
-        # Check final profit/stop loss levels
-        current_price = self._get_current_price()
-        
-        if self._check_final_levels_hit(current_price):
-            return self._close_all_positions_and_stop()
+        # Check final profit/stop loss levels only if we have accumulated positions
+        if self.total_accumulated_position != Decimal("0"):
+            current_price = self._get_current_price()
+            if self._check_final_levels_hit(current_price):
+                return self._close_all_positions_and_stop()
 
         # Manage active level groups
         for level_group in self.level_groups:
@@ -351,7 +350,6 @@ class StrategyControllerBase(ControllerBase):
         )
 
         level_group.accumulate_executor_id = action.executor_config.id
-        self.logger().info(f"✅ Accumulate executor created with ID: {action.executor_config.id}")
         return action
 
     def _create_profit_executor(self, level_group: LevelGroup) -> CreateExecutorAction:
