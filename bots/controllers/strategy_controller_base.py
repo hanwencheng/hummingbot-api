@@ -139,12 +139,6 @@ class StrategyControllerBase(ControllerBase):
         self.total_accumulated_position = Decimal("0")
         self.processed_data = {}  # Initialize processed data
 
-        # Use Hummingbot's logging system (no custom logger setup)
-        # The framework provides self.logger automatically
-
-        # Initialize level groups - defer complex calculations until after connector is ready
-        # This prevents interfering with connector initialization
-
         # Initialize market data provider (same as PMM strategy)
         self.market_data_provider.initialize_rate_sources([
             ConnectorPair(
@@ -218,9 +212,7 @@ class StrategyControllerBase(ControllerBase):
             # Calculate final levels and initialize level groups
             self._calculate_final_levels()
             self._initialize_level_groups()
-            self.logger().info(f"self.config.final_profit_level:{self.config.final_profit_level} self.config.final_stop_loss_level{self.config.final_stop_loss_level}")
 
-        self.logger().info(f"level groups: {self.level_groups}")
         # Check time limit
         if self._check_time_limit_exceeded():
             return self._close_all_positions_and_stop()
@@ -228,7 +220,6 @@ class StrategyControllerBase(ControllerBase):
     
         # Check final profit/stop loss levels
         current_price = self._get_current_price()
-        self.logger().info(f"current_price: {current_price}")
         
         if self._check_final_levels_hit(current_price):
             return self._close_all_positions_and_stop()
@@ -324,7 +315,6 @@ class StrategyControllerBase(ControllerBase):
         """Manage a single level group"""
         actions = []
 
-        self.logger().info(f"level_group{level_group.level_index}: accumulate_active:{level_group.accumulate_active} accumulate_executor_id:{level_group.accumulate_executor_id}")
 
         # Check if accumulate level should be active and create executor if needed
         if level_group.accumulate_active and not level_group.accumulate_executor_id:
@@ -343,10 +333,6 @@ class StrategyControllerBase(ControllerBase):
     def _create_accumulate_executor(self, level_group: LevelGroup) -> CreateExecutorAction:
         """Create limit order executor for accumulate level"""
         accumulate_level = level_group.accumulate_level
-
-        self.logger().info(f"🏗️ Creating accumulate order - Level {level_group.level_index}: "
-                        f"Side={accumulate_level['side']}, Price={accumulate_level['price']}, "
-                        f"Size={accumulate_level['size']}")
 
         executor_config = OrderExecutorConfig(
             timestamp=self.market_data_provider.time(),
