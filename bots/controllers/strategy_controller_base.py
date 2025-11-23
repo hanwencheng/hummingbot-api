@@ -1,7 +1,7 @@
 from decimal import Decimal
 from enum import Enum
 from typing import Dict, List, Optional, Union
-from pydantic import Field, validator
+from pydantic import Field, field_validator, validator
 
 from hummingbot.core.data_type.common import OrderType, PositionMode, TradeType
 from hummingbot.data_feed.candles_feed.data_types import CandlesConfig
@@ -43,16 +43,16 @@ class StrategyControllerConfigBase(ControllerConfigBase):
         }
     )
     trading_pair: str = Field(
-        default="BTC-USDT",
+        default="BTC-USD",
         json_schema_extra={
             "prompt_on_new": True,
-            "prompt": "Enter the trading pair to trade on (e.g., BTC-USDT):",
+            "prompt": "Enter the trading pair to trade on (e.g., BTC-USD):",
         }
     )
 
     # Strategy parameters
     ticker: str = Field(
-        default="BTC-USDT",
+        default="BTC-USD",
         json_schema_extra={
             "prompt_on_new": True,
             "prompt": "Enter the ticker symbol:",
@@ -108,7 +108,7 @@ class StrategyControllerConfigBase(ControllerConfigBase):
     profit_skew: Decimal = Field(default=Decimal("1"))
     stop_loss_skew: Decimal = Field(default=Decimal("0"))
 
-    @validator('level_pct', 'accumulate_skew', 'profit_skew', 'stop_loss_skew')
+    @field_validator('level_pct', 'accumulate_skew', 'profit_skew', 'stop_loss_skew')
     def validate_percentages(cls, v):
         if v < 0 or v > 1:
             raise ValueError("Percentage values must be between 0 and 1")
@@ -125,7 +125,7 @@ class StrategyControllerBase(ControllerBase):
         super().__init__(config, *args, **kwargs)
         self.config = config
         self.level_groups: List[LevelGroup] = []
-        self.strategy_start_time = self.current_timestamp
+        self.strategy_start_time = None  # Will be set in first update cycle
         self.strategy_active = True
         self.total_accumulated_position = Decimal("0")
 
@@ -140,10 +140,10 @@ class StrategyControllerBase(ControllerBase):
         direction_multiplier = 1 if self.config.direction_buy else -1
 
         self.config.final_profit_level = self.config.entry_price * (
-            1 + direction_multiplier * self.config.level_number * self.config.level_pct
+            1 + direction_multiplier * self.config.level_number * self.config.level_pct * self.config.entry_price
         )
         self.config.final_stop_loss_level = self.config.entry_price * (
-            1 - direction_multiplier * 2 * self.config.level_number * self.config.level_pct
+            1 - direction_multiplier * 2 * self.config.level_number * self.config.level_pct * self.config.entry_price
         )
 
     def _initialize_level_groups(self):
@@ -155,7 +155,7 @@ class StrategyControllerBase(ControllerBase):
 
             # Calculate accumulate level
             accumulate_price = self.config.entry_price - (
-                i * self.config.level_pct * direction_multiplier * self.config.accumulate_skew
+                i * self.config.level_pct * self.config.entry_price* direction_multiplier * self.config.accumulate_skew
             )
             level_group.accumulate_level = {
                 "price": accumulate_price,
@@ -165,7 +165,7 @@ class StrategyControllerBase(ControllerBase):
 
             # Calculate profit level
             profit_price = self.config.final_profit_level - (
-                i * self.config.level_pct * direction_multiplier * self.config.profit_skew
+                i * self.config.level_pct * self.config.entry_price *  direction_multiplier * self.config.profit_skew
             )
             profit_size = self.config.level_size / accumulate_price * profit_price
             level_group.profit_level = {
@@ -176,7 +176,7 @@ class StrategyControllerBase(ControllerBase):
 
             # Calculate stop loss level
             stop_loss_price = self.config.final_stop_loss_level + (
-                (self.config.level_number - i + 1) * self.config.level_pct *
+                (self.config.level_number - i + 1) * self.config.level_pct * self.config.entry_price *
                 direction_multiplier * self.config.stop_loss_skew
             )
             stop_loss_size = self.config.level_size / accumulate_price * stop_loss_price
@@ -191,6 +191,10 @@ class StrategyControllerBase(ControllerBase):
     def determine_executor_actions(self) -> List[ExecutorAction]:
         """Main strategy logic - determine what actions to take"""
         actions = []
+
+        # Initialize start time on first call
+        if self.strategy_start_time is None:
+            self.strategy_start_time = self.current_timestamp
 
         if not self.strategy_active:
             return actions
@@ -220,6 +224,8 @@ class StrategyControllerBase(ControllerBase):
 
     def _check_time_limit_exceeded(self) -> bool:
         """Check if strategy has exceeded time limit"""
+        if self.strategy_start_time is None:
+            return False
         time_elapsed_hours = (self.current_timestamp - self.strategy_start_time) / 3600
         return time_elapsed_hours > self.config.time_limit
 
