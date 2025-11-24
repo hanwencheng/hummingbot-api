@@ -47,6 +47,31 @@ async def list_account_credentials(account_name: str,
         raise HTTPException(status_code=500, detail=str(e))
 
 
+@router.get("/{account_name}/credentials/{connector_name}", response_model=Dict)
+async def get_account_credential_details(account_name: str, connector_name: str,
+                                        accounts_service: AccountsService = Depends(get_accounts_service)):
+    """
+    Get the credential details (API keys, etc.) for a specific account and connector.
+
+    Args:
+        account_name: Name of the account
+        connector_name: Name of the connector
+
+    Returns:
+        Dictionary containing the decrypted credentials
+
+    Raises:
+        HTTPException: 404 if account or credentials not found
+    """
+    try:
+        credentials = await accounts_service.get_credentials(account_name, connector_name)
+        return credentials
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 @router.post("/add-account", status_code=status.HTTP_201_CREATED)
 async def add_account(account_name: str, accounts_service: AccountsService = Depends(get_accounts_service)):
     """

@@ -444,6 +444,76 @@ class AccountsService:
         except FileNotFoundError as e:
             raise HTTPException(status_code=404, detail=str(e))
 
+    async def get_credentials(self, account_name: str, connector_name: str) -> Dict:
+        """
+        Get the decrypted credential details for a specific account and connector.
+        :param account_name: The name of the account.
+        :param connector_name: The name of the connector.
+        :return: Dictionary containing the decrypted credentials.
+        """
+        try:
+            # Check if credentials file exists
+            file_path = f"credentials/{account_name}/connectors/{connector_name}.yml"
+
+            if not fs_util.path_exists(file_path):
+                raise HTTPException(status_code=404, detail=f"Credentials not found for {connector_name} in account {account_name}")
+
+            # Load the credentials file
+            credentials_data = fs_util.read_yaml_file(f"credentials/{account_name}/connectors/{connector_name}.yml")
+
+            # Get the connector config map to understand what fields are encrypted
+            # If this fails, we'll try to decrypt fields that look encrypted (end with encrypted values)
+            config_map = {}
+            try:
+                config_map_result = self.get_connector_config_map(connector_name)
+                # Handle case where result is a list instead of dict
+                if isinstance(config_map_result, list):
+                    # Convert list to a dict assuming all listed fields might be secure
+                    config_map = {field: {'is_secure': True} for field in config_map_result}
+                else:
+                    config_map = config_map_result
+            except Exception as e:
+                logger.warning(f"Could not get config map for {connector_name}: {e}")
+                # Continue without config map - we'll try to detect encrypted fields
+
+            # Decrypt the credentials
+            decrypted_credentials = {}
+            for key, value in credentials_data.items():
+                if isinstance(value, str):
+                    # Check if this field is marked as secure in config map
+                    is_secure_field = config_map.get(key, {}).get('is_secure', False) if config_map else False
+
+                    # Also try to detect encrypted fields by their content (they usually start with specific patterns)
+                    looks_encrypted = (
+                        value.startswith('0x') or  # Hex encoded
+                        len(value) > 50 or         # Usually encrypted values are longer
+                        ('secret' in key.lower() or 'key' in key.lower() or 'private' in key.lower())  # Common secret field names
+                    )
+
+                    if is_secure_field or looks_encrypted:
+                        # This is likely an encrypted field, try to decrypt it
+                        try:
+                            decrypted_value = self.secrets_manager.decrypt_secret_value(key, value)
+                            decrypted_credentials[key] = decrypted_value
+                        except Exception as e:
+                            # If decryption fails, return the original value (might not be encrypted)
+                            logger.warning(f"Failed to decrypt {key}: {e}")
+                            decrypted_credentials[key] = value
+                    else:
+                        # Not an encrypted field, return as is
+                        decrypted_credentials[key] = value
+                else:
+                    # Not a string, return as is
+                    decrypted_credentials[key] = value
+
+            return decrypted_credentials
+
+        except HTTPException:
+            raise
+        except Exception as e:
+            logger.error(f"Error getting credentials for {connector_name} in account {account_name}: {e}")
+            raise HTTPException(status_code=500, detail=str(e))
+
     async def delete_credentials(self, account_name: str, connector_name: str):
         """
         Delete the credentials of the specified connector for the specified account.
