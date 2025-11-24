@@ -9,30 +9,14 @@ from hummingbot.data_feed.candles_feed.data_types import CandlesConfig
 from hummingbot.strategy_v2.controllers.controller_base import ControllerBase, ControllerConfigBase
 from hummingbot.strategy_v2.executors.data_types import ConnectorPair
 from hummingbot.strategy_v2.executors.position_executor.data_types import PositionExecutorConfig, TripleBarrierConfig
-from hummingbot.strategy_v2.executors.order_executor.data_types import OrderExecutorConfig, ExecutionStrategy
 from hummingbot.strategy_v2.models.executor_actions import CreateExecutorAction, ExecutorAction, StopExecutorAction
 from hummingbot.strategy_v2.models.executors import CloseType
 from hummingbot.core.data_type.common import PriceType, MarketDict
-from hummingbot.strategy_v2.executors.data_types import ConnectorPair
-
-class LevelGroup:
-    """Represents a group of levels: accumulate, profit, and stop_loss"""
-    def __init__(self, level_index: int):
-        self.level_index = level_index
-        self.accumulate_level: Optional[dict] = None
-        self.profit_level: Optional[dict] = None
-        self.stop_loss_level: Optional[dict] = None
-        self.accumulate_active = True
-        self.profit_active = False
-        self.stop_loss_active = False
-        self.accumulate_executor_id: Optional[str] = None
-        self.profit_executor_id: Optional[str] = None
-        self.stop_loss_executor_id: Optional[str] = None
 
 
 class StrategyControllerConfigBase(ControllerConfigBase):
     """
-    Base configuration for strategy controllers with level-based trading.
+    Base configuration for strategy controllers with level-based trading using TripleBarrierConfig.
     """
     controller_type: str = "market_making"
     candles_config: List[CandlesConfig] = []
@@ -54,13 +38,6 @@ class StrategyControllerConfigBase(ControllerConfigBase):
     )
 
     # Strategy parameters
-    ticker: str = Field(
-        default="BTC-USD",
-        json_schema_extra={
-            "prompt_on_new": True,
-            "prompt": "Enter the ticker symbol:",
-        }
-    )
     direction_buy: bool = Field(
         default=True,
         json_schema_extra={
@@ -97,10 +74,17 @@ class StrategyControllerConfigBase(ControllerConfigBase):
         }
     )
     time_limit: int = Field(
-        default=24,
+        default=168,
         json_schema_extra={
             "prompt_on_new": True,
             "prompt": "Enter the maximum strategy duration in hours:",
+        }
+    )
+    leverage: int = Field(
+        default=10,
+        json_schema_extra={
+            "prompt_on_new": True,
+            "prompt": "Enter the leverage to use for trading (e.g., 10 for 10x leverage):",
         }
     )
 
@@ -127,17 +111,16 @@ class StrategyControllerConfigBase(ControllerConfigBase):
 
 class StrategyControllerBase(ControllerBase):
     """
-    Base class for level-based trading strategies.
-    Implements the core logic for managing level groups with accumulate, profit, and stop-loss levels.
+    Base class for level-based trading strategies using TripleBarrierConfig.
+    Implements the core logic for managing levels with automatic stop-loss/take-profit handling.
     """
 
     def __init__(self, config: StrategyControllerConfigBase, *args, **kwargs):
         super().__init__(config, *args, **kwargs)
         self.config = config
-        self.level_groups: List[LevelGroup] = []
         self.strategy_start_time = None  # Will be set in first update cycle
-        self.total_accumulated_position = Decimal("0")
         self.processed_data = {}  # Initialize processed data
+        self.level_states = {}  # Track which levels are active
 
         # Initialize market data provider (same as PMM strategy)
         self.market_data_provider.initialize_rate_sources([
@@ -147,71 +130,165 @@ class StrategyControllerBase(ControllerBase):
             )
         ])
 
+    def update_config(self, new_config: StrategyControllerConfigBase):
+        """
+        Update controller configuration and refresh all cached/calculated values.
+        This ensures that config changes are properly reflected in trading behavior.
+        """
+        old_config = self.config
+        self.config = new_config
+
+        # Log the config update for debugging
+        self.logger().info(f"Updating config for controller {self.config.id}")
+        self.logger().info(f"Old entry_price: {old_config.entry_price}, New entry_price: {new_config.entry_price}")
+        self.logger().info(f"Old level_size: {old_config.level_size}, New level_size: {new_config.level_size}")
+        self.logger().info(f"Old leverage: {old_config.leverage}, New leverage: {new_config.leverage}")
+
+        # Clear cached data that depends on configuration
+        self.processed_data.clear()
+        self.level_states.clear()
+
+        # Recalculate levels with new configuration
+        self._calculate_final_levels()
+
+        # Update market data provider if trading pair changed
+        if (old_config.connector_name != new_config.connector_name or
+            old_config.trading_pair != new_config.trading_pair):
+            self.market_data_provider.initialize_rate_sources([
+                ConnectorPair(
+                    connector_name=new_config.connector_name,
+                    trading_pair=new_config.trading_pair
+                )
+            ])
+
+        # Call parent update_config to handle framework-level updates
+        super().update_config(new_config)
+
+        # Check if critical trading parameters changed that require executor restart
+        critical_params_changed = (
+            old_config.entry_price != new_config.entry_price or
+            old_config.level_size != new_config.level_size or
+            old_config.level_pct != new_config.level_pct or
+            old_config.leverage != new_config.leverage or
+            old_config.direction_buy != new_config.direction_buy
+        )
+
+        if critical_params_changed:
+            self.logger().info(f"Critical parameters changed - stopping active executors to apply new config")
+            # Get all active executors for this controller
+            from hummingbot.strategy_v2.models.executor_actions import StopExecutorAction
+            active_executors = [executor for executor in self.get_all_executors()
+                              if executor.is_active and not executor.is_trading]
+
+            if active_executors:
+                # Create stop actions for non-trading executors (let trading ones complete naturally)
+                stop_actions = [StopExecutorAction(executor_id=executor.id, controller_id=self.config.id)
+                              for executor in active_executors]
+
+                # Execute the stop actions through the orchestrator
+                if hasattr(self, 'executor_orchestrator') and self.executor_orchestrator:
+                    self.executor_orchestrator.execute_actions(stop_actions)
+                    self.logger().info(f"Stopped {len(stop_actions)} active executors due to config change")
+
+        self.logger().info(f"Config update completed for controller {self.config.id}")
+
+    @property
+    def total_accumulated_position(self) -> Decimal:
+        """
+        Get total accumulated position from framework's position tracking.
+        Replaces manual position tracking from original implementation.
+        """
+        position_held = next(
+            (position for position in self.positions_held if
+             position.trading_pair == self.config.trading_pair and
+             position.connector_name == self.config.connector_name),
+            None
+        )
+        return position_held.amount if position_held else Decimal("0")
+
     def _calculate_final_levels(self):
         """Calculate final profit and stop loss levels - to be overridden by subclasses"""
         direction_multiplier = 1 if self.config.direction_buy else -1
 
         self.config.final_profit_level = self.config.entry_price * (
-            1 + direction_multiplier * self.config.level_number * self.config.level_pct * self.config.entry_price
+            1 + direction_multiplier * self.config.level_number * self.config.level_pct
         )
         self.config.final_stop_loss_level = self.config.entry_price * (
-            1 - direction_multiplier * 2 * self.config.level_number * self.config.level_pct * self.config.entry_price
+            1 - direction_multiplier * 2 * self.config.level_number * self.config.level_pct
         )
 
-    def _initialize_level_groups(self):
-        """Initialize all level groups with their prices and sizes"""
+    def _calculate_level_prices(self, level_index: int) -> Dict[str, Decimal]:
+        """
+        Calculate prices for a specific level.
+        Returns dict with 'accumulate_price', 'profit_price', 'stop_loss_price'
+        """
         direction_multiplier = 1 if self.config.direction_buy else -1
 
-        for i in range(self.config.level_number):
-            level_group = LevelGroup(i)
+        # Calculate accumulate price (entry point for this level)
+        accumulate_price = self.config.entry_price - (
+            level_index * self.config.level_pct * self.config.entry_price *
+            direction_multiplier * self.config.accumulate_skew
+        )
 
-            # Calculate accumulate level
-            accumulate_price = self.config.entry_price - (
-                i * self.config.level_pct * self.config.entry_price* direction_multiplier * self.config.accumulate_skew
-            )
-            level_group.accumulate_level = {
-                "price": accumulate_price,
-                "size": self.config.level_size,
-                "side": TradeType.BUY if self.config.direction_buy else TradeType.SELL
-            }
+        # Calculate profit level price
+        profit_price = self.config.final_profit_level - (
+            level_index * self.config.level_pct * self.config.entry_price *
+            direction_multiplier * self.config.profit_skew
+        )
 
-            # Calculate profit level
-            profit_price = self.config.final_profit_level - (
-                i * self.config.level_pct * self.config.entry_price * direction_multiplier * self.config.profit_skew
-            )
-            # Size calculation: level_size / price of accumulate_level * price of profit_level
-            profit_size = self.config.level_size / accumulate_price * profit_price
-            level_group.profit_level = {
-                "price": profit_price,
-                "size": profit_size,
-                "side": TradeType.SELL if self.config.direction_buy else TradeType.BUY
-            }
+        # Calculate stop loss level price
+        stop_loss_price = self.config.final_stop_loss_level + (
+            (self.config.level_number - level_index - 1) * self.config.level_pct * self.config.entry_price *
+            direction_multiplier * self.config.stop_loss_skew
+        )
 
-            # Calculate stop loss level
-            stop_loss_price = self.config.final_stop_loss_level + (
-                (self.config.level_number - i - 1) * self.config.level_pct * self.config.entry_price *
-                direction_multiplier * self.config.stop_loss_skew
-            )
-            # Size calculation: level_size / price of accumulate_level * price of stop_loss_level
-            stop_loss_size = self.config.level_size / accumulate_price * stop_loss_price
-            level_group.stop_loss_level = {
-                "price": stop_loss_price,
-                "size": stop_loss_size,
-                "side": TradeType.SELL if self.config.direction_buy else TradeType.BUY
-            }
+        return {
+            'accumulate_price': accumulate_price,
+            'profit_price': profit_price,
+            'stop_loss_price': stop_loss_price
+        }
 
-            self.level_groups.append(level_group)
+    def _create_triple_barrier_config(self, level_index: int, accumulate_price: Decimal,
+                                      profit_price: Decimal, stop_loss_price: Decimal) -> TripleBarrierConfig:
+        """
+        Create TripleBarrierConfig for a specific level.
+        Converts price-based levels to percentage-based barriers.
+        """
+        # Calculate take profit percentage from accumulate price
+        if self.config.direction_buy:
+            take_profit_pct = (profit_price - accumulate_price) / accumulate_price
+        else:
+            take_profit_pct = (accumulate_price - profit_price) / accumulate_price
+
+        # Calculate stop loss percentage from accumulate price
+        if self.config.direction_buy:
+            stop_loss_pct = (accumulate_price - stop_loss_price) / accumulate_price
+        else:
+            stop_loss_pct = (stop_loss_price - accumulate_price) / accumulate_price
+
+        # Ensure percentages are positive
+        take_profit_pct = abs(take_profit_pct)
+        stop_loss_pct = abs(stop_loss_pct)
+
+        return TripleBarrierConfig(
+            take_profit=take_profit_pct,
+            stop_loss=stop_loss_pct,
+            time_limit=self.config.time_limit * 3600,  # Convert hours to seconds
+            open_order_type=OrderType.LIMIT,  # Entry order is limit order
+            take_profit_order_type=OrderType.LIMIT,  # Profit at specific price level
+            stop_loss_order_type=OrderType.MARKET,  # Stop loss triggers market order
+            time_limit_order_type=OrderType.MARKET  # Time limit triggers market order
+        )
 
     def determine_executor_actions(self) -> List[ExecutorAction]:
         """Main strategy logic - determine what actions to take"""
         actions = []
 
-        # Initialize start time and level groups on first call
+        # Initialize start time and level calculations on first call
         if self.strategy_start_time is None:
             self.strategy_start_time = self.market_data_provider.time()
-            # Calculate final levels and initialize level groups
+            # Calculate final levels
             self._calculate_final_levels()
-            self._initialize_level_groups()
 
         # Check time limit
         if self._check_time_limit_exceeded():
@@ -223,11 +300,68 @@ class StrategyControllerBase(ControllerBase):
             if self._check_final_levels_hit(current_price):
                 return self._close_all_positions_and_stop()
 
-        # Manage active level groups
-        for level_group in self.level_groups:
-            actions.extend(self._manage_level_group(level_group))
+        # Create executors for levels that need to be active
+        for level_index in range(self.config.level_number):
+            level_id = f"level_{level_index}"
+
+            # Check if this level already has an active executor
+            if not self._has_active_executor(level_id):
+                action = self._create_level_executor(level_index)
+                if action:
+                    actions.append(action)
 
         return actions
+
+    def _has_active_executor(self, level_id: str) -> bool:
+        """Check if there's an active executor for this level"""
+        return any(
+            executor.is_active and executor.custom_info.get("level_id") == level_id
+            for executor in self.executors_info
+        )
+
+    def _create_level_executor(self, level_index: int) -> Optional[CreateExecutorAction]:
+        """
+        Create a PositionExecutor with TripleBarrierConfig for a specific level.
+        This replaces the original _create_accumulate_executor logic.
+        """
+        try:
+            # Calculate level prices
+            prices = self._calculate_level_prices(level_index)
+            accumulate_price = prices['accumulate_price']
+            profit_price = prices['profit_price']
+            stop_loss_price = prices['stop_loss_price']
+
+            # Create triple barrier configuration
+            triple_barrier = self._create_triple_barrier_config(
+                level_index, accumulate_price, profit_price, stop_loss_price
+            )
+
+            # Calculate amount (convert from quote to base amount)
+            amount = self.config.level_size / accumulate_price
+
+            # Create position executor config
+            executor_config = PositionExecutorConfig(
+                timestamp=self.market_data_provider.time(),
+                connector_name=self.config.connector_name,
+                trading_pair=self.config.trading_pair,
+                side=TradeType.BUY if self.config.direction_buy else TradeType.SELL,
+                entry_price=accumulate_price,
+                amount=amount,
+                triple_barrier_config=triple_barrier,
+                leverage=self.config.leverage,
+                level_id=f"level_{level_index}"
+            )
+
+            action = CreateExecutorAction(
+                controller_id=self.config.id,
+                executor_config=executor_config
+            )
+
+            return action
+
+        except Exception as e:
+            self.logger().error(f"Error creating level executor for level {level_index}: {e}")
+            return None
 
     async def update_processed_data(self):
         """
@@ -252,14 +386,12 @@ class StrategyControllerBase(ControllerBase):
             return
 
         # Get current position if any
-        position_held = None
-        if hasattr(self, 'positions_held') and self.positions_held:
-            position_held = next(
-                (position for position in self.positions_held if
-                 position.trading_pair == self.config.trading_pair and
-                 position.connector_name == self.config.connector_name),
-                None
-            )
+        position_held = next(
+            (position for position in self.positions_held if
+             position.trading_pair == self.config.trading_pair and
+             position.connector_name == self.config.connector_name),
+            None
+        )
 
         # Calculate position metrics
         if position_held is not None:
@@ -310,141 +442,19 @@ class StrategyControllerBase(ControllerBase):
             return (current_price <= self.config.final_profit_level or
                    current_price >= self.config.final_stop_loss_level)
 
-    def _manage_level_group(self, level_group: LevelGroup) -> List[ExecutorAction]:
-        """Manage a single level group"""
-        actions = []
-
-
-        # Check if accumulate level should be active and create executor if needed
-        if level_group.accumulate_active and not level_group.accumulate_executor_id:
-            actions.append(self._create_accumulate_executor(level_group))
-
-        # Check if profit level should be active and create executor if needed
-        if level_group.profit_active and not level_group.profit_executor_id:
-            actions.append(self._create_profit_executor(level_group))
-
-        # Check if stop loss level should be active and create executor if needed
-        # if level_group.stop_loss_active and not level_group.stop_loss_executor_id:
-            # actions.append(self._create_stop_loss_executor(level_group))
-
-        return actions
-
-    def _create_accumulate_executor(self, level_group: LevelGroup) -> CreateExecutorAction:
-        """Create limit order executor for accumulate level"""
-        accumulate_level = level_group.accumulate_level
-
-        executor_config = OrderExecutorConfig(
-            timestamp=self.market_data_provider.time(),
-            connector_name=self.config.connector_name,
-            trading_pair=self.config.trading_pair,
-            side=accumulate_level["side"],
-            amount=accumulate_level["size"],
-            price=accumulate_level["price"],
-            execution_strategy=ExecutionStrategy.LIMIT,
-            level_id=f"accumulate_{level_group.level_index}"
-        )
-
-        action = CreateExecutorAction(
-            controller_id=self.config.id,
-            executor_config=executor_config
-        )
-
-        level_group.accumulate_executor_id = action.executor_config.id
-        return action
-
-    def _create_profit_executor(self, level_group: LevelGroup) -> CreateExecutorAction:
-        """Create limit order executor for profit level"""
-        profit_level = level_group.profit_level
-        executor_config = OrderExecutorConfig(
-            timestamp=self.market_data_provider.time(),
-            connector_name=self.config.connector_name,
-            trading_pair=self.config.trading_pair,
-            side=profit_level["side"],
-            amount=profit_level["size"],
-            price=profit_level["price"],
-            leverage=10,
-            execution_strategy=ExecutionStrategy.LIMIT,
-            level_id=f"profit_{level_group.level_index}"
-        )
-
-        action = CreateExecutorAction(
-            controller_id=self.config.id,
-            executor_config=executor_config
-        )
-
-        level_group.profit_executor_id = action.executor_config.id
-        return action
-
-    def _create_stop_loss_executor(self, level_group: LevelGroup) -> CreateExecutorAction:
-        """Create market order executor for stop loss level - triggers immediately when stop loss hit"""
-        stop_loss_level = level_group.stop_loss_level
-        executor_config = OrderExecutorConfig(
-            timestamp=self.market_data_provider.time(),
-            connector_name=self.config.connector_name,
-            trading_pair=self.config.trading_pair,
-            side=stop_loss_level["side"],
-            amount=stop_loss_level["size"],
-            price=stop_loss_level["price"],
-            execution_strategy=ExecutionStrategy.MARKET,  # Stop loss should be market order
-            level_id=f"stop_loss_{level_group.level_index}"
-        )
-
-        action = CreateExecutorAction(
-            controller_id=self.config.id,
-            executor_config=executor_config
-        )
-
-        level_group.stop_loss_executor_id = action.executor_config.id
-        return action
-
     def _close_all_positions_and_stop(self) -> List[ExecutorAction]:
         """Close all active positions and stop the strategy"""
         actions = []
 
         # Stop all active executors
-        for level_group in self.level_groups:
-            if level_group.accumulate_executor_id:
+        for executor in self.executors_info:
+            if executor.is_active:
                 actions.append(StopExecutorAction(
                     controller_id=self.config.id,
-                    executor_id=level_group.accumulate_executor_id
-                ))
-            if level_group.profit_executor_id:
-                actions.append(StopExecutorAction(
-                    controller_id=self.config.id,
-                    executor_id=level_group.profit_executor_id
-                ))
-            if level_group.stop_loss_executor_id:
-                actions.append(StopExecutorAction(
-                    controller_id=self.config.id,
-                    executor_id=level_group.stop_loss_executor_id
+                    executor_id=executor.id
                 ))
 
         return actions
-
-    def did_trade(self, executor_id: str, side: TradeType, amount: Decimal, price: Decimal):
-        """Handle trade events and update level group states"""
-        for level_group in self.level_groups:
-            if level_group.accumulate_executor_id == executor_id:
-                # Accumulate level filled
-                level_group.accumulate_active = False
-                level_group.profit_active = True
-                level_group.stop_loss_active = True
-                self.total_accumulated_position += amount
-                break
-            elif level_group.profit_executor_id == executor_id:
-                # Profit level filled
-                level_group.profit_active = False
-                level_group.stop_loss_active = False
-                level_group.accumulate_active = True
-                self.total_accumulated_position -= amount
-                break
-            elif level_group.stop_loss_executor_id == executor_id:
-                # Stop loss level hit
-                level_group.profit_active = False
-                level_group.stop_loss_active = False
-                level_group.accumulate_active = False
-                self.total_accumulated_position -= amount
-                break
 
     def to_format_status(self) -> List[str]:
         """
@@ -477,13 +487,25 @@ class StrategyControllerBase(ControllerBase):
         status.append(f"Total Position: {self.total_accumulated_position}")
         status.append("")
 
-        # Level group status
-        if hasattr(self, 'level_groups') and self.level_groups:
-            status.append("Level Groups Status:")
-            for i, lg in enumerate(self.level_groups):
-                acc_status = "✓" if lg.accumulate_active else "✗"
-                prof_status = "✓" if lg.profit_active else "✗"
-                stop_status = "✓" if lg.stop_loss_active else "✗"
-                status.append(f"  L{i}: Acc:{acc_status} Prof:{prof_status} Stop:{stop_status}")
+        # Active executors status
+        active_levels = []
+        for executor in self.executors_info:
+            if executor.is_active and "level_id" in executor.custom_info:
+                level_id = executor.custom_info["level_id"]
+                active_levels.append(level_id)
+
+        status.append("Active Levels:")
+        if active_levels:
+            status.append(f"  {', '.join(sorted(active_levels))}")
+        else:
+            status.append("  None")
+
+        # TripleBarrier configuration summary
+        if hasattr(self, 'config') and self.config.final_profit_level:
+            status.append("")
+            status.append("Level Configuration:")
+            status.append(f"  Final Profit: {self.config.final_profit_level}")
+            status.append(f"  Final Stop Loss: {self.config.final_stop_loss_level}")
+            status.append(f"  Skews - Acc:{self.config.accumulate_skew}, Prof:{self.config.profit_skew}, SL:{self.config.stop_loss_skew}")
 
         return status
