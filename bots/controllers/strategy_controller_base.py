@@ -112,6 +112,7 @@ class StrategyControllerConfigBase(ControllerConfigBase):
     # Strategy-specific parameters (to be set by subclasses)
     final_profit_level: Optional[Decimal] = None
     final_stop_loss_level: Optional[Decimal] = None
+    final_accumulate_price: Optional[Decimal] = None
     accumulate_skew: Decimal = Field(default=Decimal("1"))
     profit_skew: Decimal = Field(default=Decimal("1"))
     stop_loss_skew: Decimal = Field(default=Decimal("0"))
@@ -208,9 +209,14 @@ class StrategyControllerBase(ControllerBase):
         self.config.final_profit_level = self.config.entry_price * (
             1 + direction_multiplier * self.config.level_number * self.config.profit_level_pct
         )
-        self.config.final_stop_loss_level = self.config.entry_price * (
-            1 - direction_multiplier * 2 * self.config.level_number * self.config.stop_loss_pct
+
+        self.config.final_accumulate_price = self.config.entry_price * (
+            1 - self.config.level_number * self.config.accumulate_pct *
+            direction_multiplier
         )
+
+        self.config.final_stop_loss_level = self.config.final_accumulate_price - (self.config.entry_price * direction_multiplier * self.config.level_number * self.config.stop_loss_pct)
+        
 
     def _calculate_level_prices(self, level_index: int) -> Dict[str, Decimal]:
         """
@@ -233,7 +239,7 @@ class StrategyControllerBase(ControllerBase):
 
         # Calculate stop loss level price
         stop_loss_price = self.config.final_stop_loss_level + (
-            (self.config.level_number - level_index - 1) * self.config.stop_loss_pct * self.config.entry_price *
+            level_index * self.config.stop_loss_pct * self.config.entry_price *
             direction_multiplier * self.config.stop_loss_skew
         )
 
@@ -500,6 +506,7 @@ class StrategyControllerBase(ControllerBase):
             status.append("")
             status.append("Level Configuration:")
             status.append(f"  Final Profit: {self.config.final_profit_level}")
+            status.append(f"  Last Accumulate Price: {self.config.final_accumulate_price}")
             status.append(f"  Final Stop Loss: {self.config.final_stop_loss_level}")
             status.append(f"  Skews - Acc:{self.config.accumulate_skew}, Prof:{self.config.profit_skew}, SL:{self.config.stop_loss_skew}")
 
