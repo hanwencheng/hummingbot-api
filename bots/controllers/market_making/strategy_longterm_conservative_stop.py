@@ -44,18 +44,6 @@ class LongtermConservativeStop(StrategyControllerBase):
         super().__init__(config, *args, **kwargs)
         self.config = config
 
-    def _calculate_final_levels(self):
-        """Override to use strategy-specific level calculations"""
-        direction_multiplier = 1 if self.config.direction_buy else -1
-
-        self.config.final_profit_level = self.config.entry_price * (
-            1 + direction_multiplier * self.config.level_number * self.config.level_pct
-        )
-        self.config.final_stop_loss_level = self.config.entry_price * (
-            1 - direction_multiplier * 2 * self.config.level_number * self.config.level_pct
-        )
-
-        # Strategy-specific skews are already set in config class defaults
 
     def determine_executor_actions(self) -> List[ExecutorAction]:
         """
