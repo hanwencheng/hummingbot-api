@@ -66,6 +66,27 @@ class StrategyControllerConfigBase(ControllerConfigBase):
             "prompt": "Enter the percentage difference between levels (e.g., 0.01 for 1%):",
         }
     )
+    profit_level_pct: Decimal = Field(
+        default=Decimal("0.02"),
+        json_schema_extra={
+            "prompt_on_new": True,
+            "prompt": "Enter the percentage for take profit orders (e.g., 0.02 for 2%):",
+        }
+    )
+    stop_loss_pct: Decimal = Field(
+        default=Decimal("0.015"),
+        json_schema_extra={
+            "prompt_on_new": True,
+            "prompt": "Enter the percentage for stop loss orders (e.g., 0.015 for 1.5%):",
+        }
+    )
+    accumulate_pct: Decimal = Field(
+        default=Decimal("0.01"),
+        json_schema_extra={
+            "prompt_on_new": True,
+            "prompt": "Enter the percentage for accumulate orders (e.g., 0.01 for 1%):",
+        }
+    )
     level_size: Decimal = Field(
         default=Decimal("100"),
         json_schema_extra={
@@ -95,7 +116,7 @@ class StrategyControllerConfigBase(ControllerConfigBase):
     profit_skew: Decimal = Field(default=Decimal("1"))
     stop_loss_skew: Decimal = Field(default=Decimal("0"))
 
-    @field_validator('level_pct', 'accumulate_skew', 'profit_skew', 'stop_loss_skew')
+    @field_validator('level_pct', 'profit_level_pct', 'stop_loss_pct', 'accumulate_pct', 'accumulate_skew', 'profit_skew', 'stop_loss_skew')
     def validate_percentages(cls, v):
         if v < 0 or v > 1:
             raise ValueError("Percentage values must be between 0 and 1")
@@ -164,32 +185,6 @@ class StrategyControllerBase(ControllerBase):
         # Call parent update_config to handle framework-level updates
         super().update_config(new_config)
 
-        # Check if critical trading parameters changed that require executor restart
-        critical_params_changed = (
-            old_config.entry_price != new_config.entry_price or
-            old_config.level_size != new_config.level_size or
-            old_config.level_pct != new_config.level_pct or
-            old_config.leverage != new_config.leverage or
-            old_config.direction_buy != new_config.direction_buy
-        )
-
-        if critical_params_changed:
-            self.logger().info(f"Critical parameters changed - stopping active executors to apply new config")
-            # Get all active executors for this controller
-            from hummingbot.strategy_v2.models.executor_actions import StopExecutorAction
-            active_executors = [executor for executor in self.get_all_executors()
-                              if executor.is_active and not executor.is_trading]
-
-            if active_executors:
-                # Create stop actions for non-trading executors (let trading ones complete naturally)
-                stop_actions = [StopExecutorAction(executor_id=executor.id, controller_id=self.config.id)
-                              for executor in active_executors]
-
-                # Execute the stop actions through the orchestrator
-                if hasattr(self, 'executor_orchestrator') and self.executor_orchestrator:
-                    self.executor_orchestrator.execute_actions(stop_actions)
-                    self.logger().info(f"Stopped {len(stop_actions)} active executors due to config change")
-
         self.logger().info(f"Config update completed for controller {self.config.id}")
 
     @property
@@ -211,10 +206,10 @@ class StrategyControllerBase(ControllerBase):
         direction_multiplier = 1 if self.config.direction_buy else -1
 
         self.config.final_profit_level = self.config.entry_price * (
-            1 + direction_multiplier * self.config.level_number * self.config.level_pct
+            1 + direction_multiplier * self.config.level_number * self.config.profit_level_pct
         )
         self.config.final_stop_loss_level = self.config.entry_price * (
-            1 - direction_multiplier * 2 * self.config.level_number * self.config.level_pct
+            1 - direction_multiplier * 2 * self.config.level_number * self.config.stop_loss_pct
         )
 
     def _calculate_level_prices(self, level_index: int) -> Dict[str, Decimal]:
@@ -226,19 +221,19 @@ class StrategyControllerBase(ControllerBase):
 
         # Calculate accumulate price (entry point for this level)
         accumulate_price = self.config.entry_price - (
-            level_index * self.config.level_pct * self.config.entry_price *
+            level_index * self.config.accumulate_pct * self.config.entry_price *
             direction_multiplier * self.config.accumulate_skew
         )
 
         # Calculate profit level price
         profit_price = self.config.final_profit_level - (
-            level_index * self.config.level_pct * self.config.entry_price *
+            level_index * self.config.profit_level_pct * self.config.entry_price *
             direction_multiplier * self.config.profit_skew
         )
 
         # Calculate stop loss level price
         stop_loss_price = self.config.final_stop_loss_level + (
-            (self.config.level_number - level_index - 1) * self.config.level_pct * self.config.entry_price *
+            (self.config.level_number - level_index - 1) * self.config.stop_loss_pct * self.config.entry_price *
             direction_multiplier * self.config.stop_loss_skew
         )
 
