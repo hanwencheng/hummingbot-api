@@ -18,9 +18,8 @@ Key Logic:
 - Stop loss hit = wait for stop_loss_waiting_time before next signal
 """
 
-import logging
 from decimal import Decimal
-from typing import Dict, List, Optional, Set
+from typing import Dict, List, Optional
 from pydantic import Field, field_validator
 
 from hummingbot.core.data_type.common import OrderType, PositionMode, TradeType, PriceType
@@ -31,6 +30,7 @@ from hummingbot.strategy_v2.executors.position_executor.data_types import Positi
 from hummingbot.strategy_v2.models.executor_actions import CreateExecutorAction, ExecutorAction, StopExecutorAction
 from hummingbot.strategy_v2.models.executors import CloseType
 from hummingbot.core.data_type.common import MarketDict
+from sqlalchemy.sql.operators import OperatorType
 
 
 class DynamicBBGridControllerConfigBase(ControllerConfigBase):
@@ -142,7 +142,23 @@ class DynamicBBGridControllerConfigBase(ControllerConfigBase):
         json_schema_extra={"prompt": "Enter the position mode (HEDGE/ONEWAY):"}
     )
 
-    @field_validator('accumulate_pct', 'profit_pct', 'final_profit_pct', 'final_stop_loss_pct')
+    # Skew parameters for level price adjustments
+    profit_skew: Decimal = Field(
+        default=Decimal("1.0"),
+        json_schema_extra={
+            "prompt_on_new": True,
+            "prompt": "Enter the profit skew multiplier (e.g., 1.0 for equal spacing):",
+        }
+    )
+    stop_loss_skew: Decimal = Field(
+        default=Decimal("0.0"),
+        json_schema_extra={
+            "prompt_on_new": True,
+            "prompt": "Enter the stop loss skew multiplier (e.g., 0.0 for equal pricing):",
+        }
+    )
+
+    @field_validator('accumulate_pct', 'profit_pct', 'final_profit_pct', 'final_stop_loss_pct', 'profit_skew', 'stop_loss_skew')
     def validate_percentages(cls, v):
         if v < 0 or v > 1:
             raise ValueError("Percentage values must be between 0 and 1")
@@ -172,13 +188,12 @@ class DynamicBBGridControllerBase(ControllerBase):
 
         # Strategy state
         self.processed_data = {"signal": 0}
-        self.current_entry_price = None  # Set dynamically by signals
-        self.filled_levels: Set[int] = set()  # Track which levels are filled
+        self.filled_executor_ids = set()  # Set of filled executor IDs
         self.stop_loss_waiting_until = float('inf')  # Timestamp until which to wait after stop loss
 
         # Final level prices - updated only when orders change
-        self.final_take_profit_price = None
         self.final_stop_loss_price = None
+        self.direction_buy = True
 
         # Initialize market data provider
         self.market_data_provider.initialize_rate_sources([
@@ -201,14 +216,26 @@ class DynamicBBGridControllerBase(ControllerBase):
         else:
             self.stop_loss_waiting_until = float('inf')
 
+        # Update filled executor states
+        self._update_executor_fill_states()
+
+        # Check and close expired executors
+        expired_actions = self._check_and_close_expired_executors()
+        if expired_actions:
+            return expired_actions
+
         # Check final profit/stop loss if we have positions
         if self._get_total_position() != Decimal("0"):
-            if self._check_and_handle_final_levels():
-                return []  # Final levels handled, return empty actions
+            if self._check_if_hit_final_stop_loss():
+                return self.handle_final_stop_loss_hit()
+                
 
         # Process signals
         signal = self.processed_data.get("signal", 0)
-        return self._handle_signal(signal)
+        signal_actions = self._handle_signal(signal)
+        actions.extend(signal_actions)
+
+        return actions
 
 
     def _handle_signal(self, signal: int) -> List[ExecutorAction]:
@@ -216,81 +243,115 @@ class DynamicBBGridControllerBase(ControllerBase):
         Handle new signal with dynamic level management.
         """
         actions = []
+        entry_price = 0
 
         if signal == 0:
             return actions 
 
         # Determine trade direction
         trade_side = TradeType.BUY if signal > 0 else TradeType.SELL
+        direction_buy = True if signal > 0 else False
+        if self._get_total_position() == Decimal("0") and self.direction_buy != direction_buy:
+            actions.extend(self._close_all_positions_and_stop())
+        else:
+            # Check if all levels are filled
+            if len(self.filled_executor_ids) >= self.config.level_number:
+                return actions  # All levels filled, wait for profit/stop loss
 
-        # Check if all levels are filled
-        if len(self.filled_levels) >= self.config.level_number:
-            return actions  # All levels filled, wait for profit/stop loss
+            current_price = self._get_current_price()
+            if signal > 0:  # BUY signal
+                entry_price = current_price * (1 - self.config.accumulate_pct)
+            else:  # SELL signal
+                entry_price = current_price * (1 + self.config.accumulate_pct)
+            # Stop all unfilled executors and create new ones
+            actions.extend(self._stop_unfilled_executor())
 
-        # Calculate new entry price based on signal direction
-        current_price = self._get_current_price()
-        spread = self._get_spread()
-
-        if signal > 0:  # BUY signal
-            # Entry above current price for BUY accumulation
-            new_entry_price = current_price + (spread * self.config.spread_multiplier)
-        else:  # SELL signal
-            # Entry below current price for SELL accumulation
-            new_entry_price = current_price - (spread * self.config.spread_multiplier)
-
-        # Update entry price and reset timer
-        self.current_entry_price = new_entry_price
-
-        # Create/update unfilled levels
-        for level_index in range(self.config.level_number):
-            if level_index in self.filled_levels:
-                continue  # Skip filled levels
-
-            level_id = f"level_{level_index}"
-
-            # Stop existing unfilled level executor
-            existing_executor = self._get_level_executor(level_id)
-            if existing_executor and existing_executor.is_active:
-                actions.append(StopExecutorAction(
-                    controller_id=self.config.id,
-                    executor_id=existing_executor.id
-                ))
-
-            # Create new level executor with updated entry price
-            action = self._create_level_executor(level_index, new_entry_price, trade_side)
+        self.direction_buy = direction_buy
+        # Create new unfilled levels
+        unfilled_levels_number = self.config.level_number - len(self.filled_executor_ids)
+        for level_index in range(unfilled_levels_number):
+            action = self._create_level_executor(level_index, entry_price, trade_side)
             if action:
                 actions.append(action)
 
         # Update final level prices after creating new levels
-        self._update_final_level_prices()
+        # self._update_final_level_prices()
 
         return actions
+
+    def _create_triple_barrier_config(self, direction_buy: bool, accumulate_price: Decimal,
+                                      profit_price: Decimal, stop_loss_price: Decimal) -> TripleBarrierConfig:
+        """
+        Create TripleBarrierConfig for a specific level.
+        Converts price-based levels to percentage-based barriers.
+        """
+        # Calculate take profit percentage from accumulate price
+        if direction_buy:
+            take_profit_pct = (profit_price - accumulate_price) / accumulate_price
+        else:
+            take_profit_pct = (accumulate_price - profit_price) / accumulate_price
+
+        # Calculate stop loss percentage from accumulate price
+        if direction_buy:
+            stop_loss_pct = (accumulate_price - stop_loss_price) / accumulate_price
+        else:
+            stop_loss_pct = (stop_loss_price - accumulate_price) / accumulate_price
+
+        # Ensure percentages are positive
+        take_profit_pct = abs(take_profit_pct)
+        stop_loss_pct = abs(stop_loss_pct)
+
+        return TripleBarrierConfig(
+            take_profit=take_profit_pct,
+            stop_loss=stop_loss_pct,
+            time_limit=self.config.time_limit_hours * 3600,  # Convert hours to seconds
+            open_order_type=OrderType.LIMIT,  # Entry order is limit order
+            take_profit_order_type=OrderType.LIMIT,  # Profit at specific price level
+            stop_loss_order_type=OrderType.MARKET,  # Stop loss triggers market order
+            time_limit_order_type=OrderType.MARKET  # Time limit triggers market order
+        )
 
     def _create_level_executor(self, level_index: int, entry_price: Decimal, trade_side: TradeType) -> Optional[CreateExecutorAction]:
         """
         Create executor for specific level with given entry price and trade direction.
         """
         try:
-            # Calculate accumulation price for this level based on trade direction
-            if trade_side == TradeType.BUY:
-                # BUY: accumulate at lower prices (entry_price - level_offset)
-                accumulate_price = entry_price * (1 - self.config.accumulate_pct * (level_index + 1))
-            else:
-                # SELL: accumulate at higher prices (entry_price + level_offset)
-                accumulate_price = entry_price * (1 + self.config.accumulate_pct * (level_index + 1))
-
+            direction_multiplier = 1 if trade_side == TradeType.BUY else -1
             # Calculate amount
-            amount = self.config.level_size / accumulate_price
-
-            # Create triple barrier config (profit only)
-            triple_barrier = TripleBarrierConfig(
-                take_profit=self.config.profit_pct,
-                stop_loss=None,  # No individual stop loss
-                time_limit=self.config.time_limit_hours * 3600,
-                open_order_type=OrderType.LIMIT,
-                take_profit_order_type=OrderType.LIMIT,
-                time_limit_order_type=OrderType.MARKET
+            final_profit_level = entry_price * (
+                1 + direction_multiplier * self.config.level_number * self.config.profit_level_pct
             )
+
+            final_accumulate_price = entry_price * (
+                1 - self.config.level_number * self.config.accumulate_pct *
+                direction_multiplier
+            )
+
+            final_stop_loss_level = final_accumulate_price - (entry_price * direction_multiplier * self.config.level_number * self.config.stop_loss_pct)
+    
+            accumulate_price = entry_price - (
+                level_index * self.config.accumulate_pct * entry_price *
+                direction_multiplier
+            )
+
+            # Calculate profit level price
+            profit_price = final_profit_level - (
+                level_index * self.config.profit_level_pct * entry_price *
+                direction_multiplier * self.config.profit_skew
+            )
+
+            # Calculate stop loss level price
+            stop_loss_price = final_stop_loss_level + (
+                level_index * self.config.stop_loss_pct * entry_price *
+                direction_multiplier * self.config.stop_loss_skew
+            )
+
+            # Create triple barrier configuration
+            triple_barrier = self._create_triple_barrier_config(trade_side == TradeType.BUY, 
+                accumulate_price, profit_price, stop_loss_price
+            )
+
+            amount = self.config.level_size / accumulate_price
 
             # Create executor config
             executor_config = PositionExecutorConfig(
@@ -302,7 +363,7 @@ class DynamicBBGridControllerBase(ControllerBase):
                 amount=amount,
                 triple_barrier_config=triple_barrier,
                 leverage=self.config.leverage,
-                level_id=f"level_{level_index}"
+                stop_loss_price=f"{stop_loss_price}"
             )
 
             return CreateExecutorAction(
@@ -314,78 +375,120 @@ class DynamicBBGridControllerBase(ControllerBase):
             self.logger().error(f"Error creating level executor for level {level_index}: {e}")
             return None
 
-    def _get_level_executor(self, level_id: str):
-        """Get executor for specific level"""
+    def _get_executor_by_id(self, executor_id: str):
+        """Get executor by executor ID"""
         for executor in self.executors_info:
-            if executor.custom_info.get("level_id") == level_id:
+            if executor.id == executor_id:
                 return executor
         return None
 
-    def _check_and_handle_final_levels(self) -> bool:
+    def _get_filled_executor_ids(self) -> List[str]:
+        """Get list of unfilled (active) executor IDs"""
+        unfilled_ids = []
+        for executor in self.executors_info:
+            if executor.is_active and executor.id in self.filled_executor_ids:
+                unfilled_ids.append(executor.id)
+        return unfilled_ids
+    
+    def _get_unfilled_executor_ids(self) -> List[str]:
+        """Get list of unfilled (active) executor IDs"""
+        unfilled_ids = []
+        for executor in self.executors_info:
+            if executor.is_active and executor.id not in self.filled_executor_ids:
+                unfilled_ids.append(executor.id)
+        return unfilled_ids
+
+    def _update_executor_fill_states(self):
+        """Update filled executor states based on accumulation order fill status"""
+        newly_filled_ids = []
+        for executor in self.executors_info:
+            if executor.id not in self.filled_executor_ids:
+                # Check if accumulation order has been filled (partially or completely)
+                if executor.filled_amount_quote > 0:
+                    # Accumulation order has started filling
+                    self.filled_executor_ids.add(executor.id)
+                    newly_filled_ids.append(executor.id)
+
+        if newly_filled_ids:
+            self.logger().info(f"Newly filled executors (accumulation orders filled): {newly_filled_ids}. Total filled: {len(self.filled_executor_ids)}")
+
+    def _is_executor_filled(self, executor_id: str) -> bool:
+        """Check if specific executor is filled"""
+        return executor_id in self.filled_executor_ids
+
+    def _mark_executor_filled(self, executor_id: str):
+        """Mark specific executor as filled"""
+        if executor_id not in self.filled_executor_ids:
+            self.filled_executor_ids.add(executor_id)
+            self.logger().info(f"Executor {executor_id} marked as filled")
+
+    def _check_and_close_expired_executors(self) -> List[ExecutorAction]:
+        """Check for expired executors and close them"""
+        actions = []
+        current_time = self.market_data_provider.time()
+        time_limit_seconds = self.config.time_limit_hours * 3600
+
+        expired_executor_ids = []
+        for executor in self.executors_info:
+            if (executor.is_active and
+                executor.id not in self.filled_executor_ids):
+
+                # Check if executor has exceeded time limit
+                executor_age = current_time - executor.timestamp
+                if executor_age > time_limit_seconds:
+                    expired_executor_ids.append(executor.id)
+                    actions.append(StopExecutorAction(
+                        controller_id=self.config.id,
+                        executor_id=executor.id
+                    ))
+
+        # TODO to be deleted after test
+        if expired_executor_ids:
+            self.logger().info(f"Closing expired executors: {expired_executor_ids}")
+
+        return actions
+
+    def _get_executor_time_remaining(self, executor_id: str) -> float:
+        """Get remaining time for executor in hours"""
+        executor = self._get_executor_by_id(executor_id)
+        if not executor:
+            return 0.0
+
+        current_time = self.market_data_provider.time()
+        time_limit_seconds = self.config.time_limit_hours * 3600
+        executor_age = current_time - executor.timestamp
+        remaining_seconds = time_limit_seconds - executor_age
+
+        return max(0.0, remaining_seconds / 3600)
+
+    def _check_if_hit_final_stop_loss(self) -> bool:
         """Check if final profit or stop loss levels have been hit and handle them"""
-        if self.final_take_profit_price is None and self.final_stop_loss_price is None:
+        if self.final_stop_loss_price is None:
             return False
 
         current_price = self._get_current_price()
         if current_price == Decimal("0"):
             return False
 
-        # Check if current price hits final levels
-        # For BUY accumulation: TP when price >= final_take_profit_price, SL when price <= final_stop_loss_price
-        # For SELL accumulation: TP when price <= final_take_profit_price, SL when price >= final_stop_loss_price
-        take_profit_hit = False
-        stop_loss_hit = False
-
-        if self._is_buy_accumulation():
-            # BUY accumulation: price goes UP for profit, DOWN for stop loss
-            take_profit_hit = (self.final_take_profit_price and
-                              current_price >= self.final_take_profit_price)
+        if self.direction_buy:
             stop_loss_hit = (self.final_stop_loss_price and
                             current_price <= self.final_stop_loss_price)
         else:
-            # SELL accumulation: price goes DOWN for profit, UP for stop loss
-            take_profit_hit = (self.final_take_profit_price and
-                              current_price <= self.final_take_profit_price)
             stop_loss_hit = (self.final_stop_loss_price and
                             current_price >= self.final_stop_loss_price)
 
-        if not take_profit_hit and not stop_loss_hit:
-            return False
+        return stop_loss_hit
 
+    def handle_final_stop_loss_hit(self):
         self._close_all_positions_and_stop()
 
         # If stop loss hit, set waiting time
-        if stop_loss_hit:
-            self.stop_loss_waiting_until = (
-                self.market_data_provider.time() +
-                self.config.stop_loss_waiting_time_hours * 3600
-            )
-            self.logger().info(f"Stop loss hit at {current_price} (final SL: {self.final_stop_loss_price}). Waiting {self.config.stop_loss_waiting_time_hours} hours before next signal.")
-        else:
-            self.logger().info(f"Final profit hit at {current_price} (final TP: {self.final_take_profit_price}). Ready for next signal.")
-
+        self.stop_loss_waiting_until = (
+            self.market_data_provider.time() +
+            self.config.stop_loss_waiting_time_hours * 3600
+        )
+        self.logger().info(f"Stop loss hit at {self.final_stop_loss_price} (final SL: {self.final_stop_loss_price}). Waiting {self.config.stop_loss_waiting_time_hours} hours before next signal.")
         self._reset_strategy_state()
-
-        return True
-
-    def _close_incomplete_levels(self) -> List[ExecutorAction]:
-        """Close all incomplete (unfilled) levels due to time limit"""
-        actions = []
-
-        # Close all active unfilled level executors
-        for executor in self.executors_info:
-            if executor.is_active and "level_id" in executor.custom_info:
-                level_num = int(executor.custom_info["level_id"].split("_")[1])
-                if level_num not in self.filled_levels:
-                    actions.append(StopExecutorAction(
-                        controller_id=self.config.id,
-                        executor_id=executor.id
-                    ))
-
-        # Reset state for new signal
-        self._reset_strategy_state()
-
-        return actions
 
     def _close_all_positions_and_stop(self) -> List[ExecutorAction]:
         """Close all active positions"""
@@ -396,13 +499,23 @@ class DynamicBBGridControllerBase(ControllerBase):
                     controller_id=self.config.id,
                     executor_id=executor.id
                 ))
+        self._reset_strategy_state()
+        return actions
+
+    def _stop_unfilled_executor(self) -> List[ExecutorAction]:
+        actions = []
+        unfilled_executor_ids = self._get_unfilled_executor_ids()
+        for executor_id in unfilled_executor_ids:
+            actions.append(StopExecutorAction(
+                controller_id=self.config.id,
+                executor_id=executor_id
+            ))
+        self._reset_strategy_state()
         return actions
 
     def _reset_strategy_state(self):
         """Reset strategy state for new signal"""
-        self.current_entry_price = None
-        self.filled_levels.clear()
-        self.final_take_profit_price = None
+        self.filled_executor_ids.clear()
         self.final_stop_loss_price = None
 
     def _get_current_price(self) -> Decimal:
@@ -418,18 +531,6 @@ class DynamicBBGridControllerBase(ControllerBase):
             if connector and connector.ready:
                 return Decimal(str(connector.get_mid_price(self.config.trading_pair)))
             return Decimal("0")
-
-    def _get_spread(self) -> Decimal:
-        """Get current bid-ask spread"""
-        try:
-            connector = self.connectors.get(self.config.connector_name)
-            if connector and connector.ready:
-                bid_price = Decimal(str(connector.get_price(self.config.trading_pair, False)))
-                ask_price = Decimal(str(connector.get_price(self.config.trading_pair, True)))
-                return ask_price - bid_price
-        except:
-            pass
-        return self._get_current_price() * Decimal("0.001")  # Fallback: 0.1% of price
 
     def _get_total_position(self) -> Decimal:
         """Get total position size"""
@@ -453,29 +554,23 @@ class DynamicBBGridControllerBase(ControllerBase):
 
         return total_value / total_amount if total_amount > 0 else Decimal("0")
 
-    def _update_final_level_prices(self):
+    def _update_final_stop_loss_price(self):
         """Update final level prices based on active executors"""
-        highest_take_profit_price = None
-        lowest_stop_loss_price = None
+        final_stop_loss_price = None
+        filled_executor_ids = self._get_filled_executor_ids();
+        direction_multiplier = 1 if self.direction_buy else -1
 
         for executor in self.executors_info:
-            if executor.is_active and executor.side == TradeType.BUY:
-                # Calculate take profit price for this level
-                take_profit_price = executor.entry_price * (1 + self.config.profit_pct)
-
+            if executor.is_active and executor.id in filled_executor_ids:
                 # Calculate stop loss price for this level
-                stop_loss_price = executor.entry_price * (1 - self.config.final_stop_loss_pct)
+                if "stop_loss_price" in executor.custom_info:
+                    stop_loss_price = executor.custom_info.get("stop_loss_price")
+                    if final_stop_loss_price is None or stop_loss_price * direction_multiplier < final_stop_loss_price * direction_multiplier:
+                        final_stop_loss_price = float(stop_loss_price)
+                else:
+                    self.logger().error("no stop loss price in the executor config")
 
-                # Track highest take profit price
-                if highest_take_profit_price is None or take_profit_price > highest_take_profit_price:
-                    highest_take_profit_price = take_profit_price
-
-                # Track lowest stop loss price
-                if lowest_stop_loss_price is None or stop_loss_price < lowest_stop_loss_price:
-                    lowest_stop_loss_price = stop_loss_price
-
-        self.highest_take_profit_price = highest_take_profit_price
-        self.lowest_stop_loss_price = lowest_stop_loss_price
+        self.final_stop_loss_price = final_stop_loss_price
 
     async def update_processed_data(self):
         """
@@ -504,11 +599,24 @@ class DynamicBBGridControllerBase(ControllerBase):
         signal_str = "BUY" if signal > 0 else "SELL" if signal < 0 else "HOLD"
         status.append(f"Signal: {signal_str} ({signal})")
 
-        if self.current_entry_price:
-            status.append(f"Entry Price: {self.current_entry_price}")
-
         # Level info
-        status.append(f"Filled Levels: {len(self.filled_levels)} / {self.config.level_number}")
+        status.append(f"Filled Levels: {len(self.filled_executor_ids)} / {self.config.level_number}")
         status.append(f"Total Position: {self._get_total_position()}")
+
+        # Show active executor info
+        active_executors = [e for e in self.executors_info if e.is_active and e.id not in self.filled_executor_ids]
+        if active_executors:
+            status.append("")
+            status.append("Active Executors:")
+            for executor in active_executors[:3]:  # Show up to 3 for brevity
+                time_remaining = self._get_executor_time_remaining(executor.id)
+                status.append(f"  {executor.id[:8]}... | {time_remaining:.1f}h remaining | Price: {executor.entry_price}")
+
+            if len(active_executors) > 3:
+                status.append(f"  ... and {len(active_executors) - 3} more")
+
+        # Show filled executor IDs if any
+        if self.filled_executor_ids:
+            status.append(f"Filled Executor IDs: {sorted(list([id[:8] + '...' for id in self.filled_executor_ids]))}")
 
         return status

@@ -295,7 +295,7 @@ class StrategyControllerBase(ControllerBase):
 
         # If strategy has been stopped, only return stop actions for any remaining active executors
         if self.strategy_stopped:
-            return
+            return actions
 
         # Check time limit
         if self._check_time_limit_exceeded():
