@@ -2,7 +2,7 @@
 Bollinger Bands Dynamic BB-Grid Strategy V1
 
 Advanced Bollinger Bands strategy with dynamic grid management:
-- Signal-based entry level adjustment (signal + 2*spread)
+- Signal-based entry level adjustment (signal + 2*profit_pct)
 - Keep filled levels, update unfilled levels on new signals
 - BUY signal when BBP < bb_long_threshold (oversold condition)
 - Dynamic level management with no cooldown
@@ -43,7 +43,7 @@ class BollingerDynamicBBGridV1Config(DynamicBBGridControllerConfigBase):
         }
     )
     interval: str = Field(
-        default="3m",
+        default="15m",
         json_schema_extra={
             "prompt": "Enter the candle interval (e.g., 1m, 5m, 1h, 1d): ",
             "prompt_on_new": True
@@ -105,8 +105,6 @@ class BollingerDynamicBBGridV1Controller(DynamicBBGridControllerBase):
     - Both signals trigger level creation/updates for perpetual trading
 
     Dynamic Grid Logic:
-    - BUY signal sets new entry level = signal_price + spread_multiplier*spread
-    - SELL signal sets new entry level = signal_price - spread_multiplier*spread
     - Unfilled levels update to new entry prices, filled levels remain unchanged
     - All levels filled = wait for profit/stop loss targets
     """
@@ -129,7 +127,7 @@ class BollingerDynamicBBGridV1Controller(DynamicBBGridControllerBase):
     async def update_processed_data(self):
         """
         Update processed data with Bollinger Bands signal.
-        Only generates BUY signals for oversold conditions.
+        Generates both BUY and SELL signals based on Bollinger Bands position.
         """
         try:
             # Get candles data
@@ -140,8 +138,12 @@ class BollingerDynamicBBGridV1Controller(DynamicBBGridControllerBase):
                 max_records=self.max_records
             )
 
+            # Debug logging for data availability
+            self.logger().info(f"Backtesting Debug: Got candles data - rows: {len(df) if df is not None else 0}, required: {self.config.bb_length}")
+
             if df is None or len(df) < self.config.bb_length:
                 # Not enough data for BB calculation
+                self.logger().warning(f"Backtesting Debug: Insufficient data for BB calculation. Need {self.config.bb_length}, got {len(df) if df is not None else 0}")
                 self.processed_data = {
                     "signal": 0,
                     "features": df if df is not None else pd.DataFrame()
@@ -163,22 +165,29 @@ class BollingerDynamicBBGridV1Controller(DynamicBBGridControllerBase):
                 # Fallback: look for any BBP column
                 bbp_cols = [col for col in df.columns if 'BBP' in col]
                 if not bbp_cols:
-                    self.logger().error(f"No BBP column found. Available columns: {list(df.columns)}")
+                    self.logger().error(f"Backtesting Debug: No BBP column found. Available columns: {list(df.columns)}")
                     self.processed_data = {"signal": 0, "features": df}
                     return
                 bbp_col = bbp_cols[0]
-                self.logger().warning(f"Using fallback BBP column: {bbp_col}")
+                self.logger().warning(f"Backtesting Debug: Using fallback BBP column: {bbp_col}")
 
             bbp = df[bbp_col].iloc[-1]  # Get latest BBP value
+            current_price = self._get_current_price()
+
+            # Debug logging for BBP and thresholds
+            self.logger().info(f"Backtesting Debug: BBP={bbp:.4f}, Long threshold={self.config.bb_long_threshold}, Short threshold={self.config.bb_short_threshold}, Price={current_price}")
 
             # Generate signal based on BBP thresholds
             # BUY signals (oversold condition) and SELL signals (overbought condition)
             if bbp < self.config.bb_long_threshold:
                 signal = 1  # BUY (oversold)
+                self.logger().info(f"Backtesting Debug: BUY signal generated - BBP {bbp:.4f} < {self.config.bb_long_threshold}")
             elif bbp > self.config.bb_short_threshold:
                 signal = -1  # SELL (overbought)
+                self.logger().info(f"Backtesting Debug: SELL signal generated - BBP {bbp:.4f} > {self.config.bb_short_threshold}")
             else:
                 signal = 0  # HOLD (neutral zone)
+                self.logger().info(f"Backtesting Debug: HOLD signal - BBP {bbp:.4f} in neutral zone ({self.config.bb_long_threshold} to {self.config.bb_short_threshold})")
 
             # Store processed data
             self.processed_data = {
@@ -187,60 +196,36 @@ class BollingerDynamicBBGridV1Controller(DynamicBBGridControllerBase):
                 "bbp": bbp,
                 "bb_long_threshold": self.config.bb_long_threshold,
                 "bb_short_threshold": self.config.bb_short_threshold,
-                "current_price": self._get_current_price()
+                "current_price": current_price
             }
 
             # Log signal for debugging
             if signal != 0:
-                current_price = self.processed_data["current_price"]
-                spread = self._get_spread()
-
                 if signal > 0:
                     signal_type = "BUY"
                     threshold = self.config.bb_long_threshold
-                    entry_price = current_price + (spread * self.config.spread_multiplier)
+                    entry_price = current_price * (1 - self.config.accumulate_pct)
                     condition = f"BBP: {bbp:.3f} < {threshold}"
                 else:
                     signal_type = "SELL"
                     threshold = self.config.bb_short_threshold
-                    entry_price = current_price - (spread * self.config.spread_multiplier)
+                    entry_price = current_price * (1 + self.config.accumulate_pct)
                     condition = f"BBP: {bbp:.3f} > {threshold}"
 
                 self.logger().info(
                     f"Dynamic BB-Grid {signal_type} Signal | {condition} | "
                     f"Price: {current_price} | Entry will be: {entry_price}"
                 )
+            else:
+                # Log even when signal is 0 during backtesting for debugging
+                self.logger().info(f"Backtesting Debug: No signal - BBP {bbp:.4f} between thresholds {self.config.bb_long_threshold} and {self.config.bb_short_threshold}")
 
         except Exception as e:
             self.logger().error(f"Error updating processed data: {e}")
+            import traceback
+            self.logger().error(f"Backtesting Debug: Full traceback: {traceback.format_exc()}")
             self.processed_data = {"signal": 0, "features": pd.DataFrame()}
 
-    def _track_filled_levels(self):
-        """
-        Track which levels have been filled by monitoring executor states.
-        """
-        # Check for newly filled levels
-        for executor in self.executors_info:
-            if (executor.custom_info.get("level_id") and
-                not executor.is_active and
-                executor.close_type and
-                executor.close_type != CloseType.EXPIRED):
-
-                # Extract level number from level_id
-                level_num = int(executor.custom_info["level_id"].split("_")[1])
-                if level_num not in self.filled_levels:
-                    self.filled_levels.add(level_num)
-                    self.logger().info(f"Level {level_num} filled and added to filled levels")
-
-    def determine_executor_actions(self):
-        """
-        Enhanced executor actions with filled level tracking.
-        """
-        # Track filled levels before processing
-        self._track_filled_levels()
-
-        # Call parent method
-        return super().determine_executor_actions()
 
     def to_format_status(self) -> List[str]:
         """Get formatted status with BB-specific information"""
@@ -257,13 +242,24 @@ class BollingerDynamicBBGridV1Controller(DynamicBBGridControllerBase):
             status.append(f"  BB Std Dev: {self.config.bb_std}")
 
         # Add dynamic grid specific info
-        if self.current_entry_price:
-            status.append("")
-            status.append("Dynamic Grid Info:")
-            status.append(f"  Current Entry: {self.current_entry_price}")
-            status.append(f"  Spread Multiplier: {self.config.spread_multiplier}")
+        status.append("")
+        status.append("Dynamic Grid Info:")
+        status.append(f"  Direction: {'BUY' if self.direction_buy else 'SELL'}")
+        status.append(f"  Accumulate %: {self.config.accumulate_pct:.2%}")
+        status.append(f"  Profit %: {self.config.profit_pct:.2%}")
 
-            if self.filled_levels:
-                status.append(f"  Filled Levels: {sorted(list(self.filled_levels))}")
+        if hasattr(self, 'filled_executor_ids'):
+            status.append(f"  Filled Executors: {len(self.filled_executor_ids)}")
+            status.append(f"  Total Executors: {len([e for e in self.executors_info if e.is_active])}")
+
+        if self.final_stop_loss_price:
+            status.append(f"  Final Stop Loss: {self.final_stop_loss_price}")
+
+        # Add stop loss waiting info
+        if self.stop_loss_waiting_until != 9999999999:
+            current_time = self.market_data_provider.time()
+            if current_time < self.stop_loss_waiting_until:
+                remaining_hours = (self.stop_loss_waiting_until - current_time) / 3600
+                status.append(f"  Stop Loss Wait: {remaining_hours:.1f}h remaining")
 
         return status

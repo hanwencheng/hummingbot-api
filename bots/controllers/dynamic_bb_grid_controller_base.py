@@ -65,33 +65,31 @@ class DynamicBBGridControllerConfigBase(ControllerConfigBase):
         }
     )
     level_size: Decimal = Field(
-        default=Decimal("100"),
+        default=Decimal("500"),
         json_schema_extra={
             "prompt_on_new": True,
             "prompt": "Enter the quote asset amount for each level:",
         }
     )
     accumulate_pct: Decimal = Field(
-        default=Decimal("0.01"),
+        default=Decimal("0.005"),
         json_schema_extra={
             "prompt_on_new": True,
             "prompt": "Enter the percentage between accumulation levels (e.g., 0.01 for 1%):",
         }
     )
     profit_pct: Decimal = Field(
-        default=Decimal("0.02"),
+        default=Decimal("0.005"),
         json_schema_extra={
             "prompt_on_new": True,
             "prompt": "Enter the percentage for profit taking (e.g., 0.02 for 2%):",
         }
     )
-
-    # Spread configuration for entry level calculation
-    spread_multiplier: Decimal = Field(
-        default=Decimal("2.0"),
+    stop_loss_pct: Decimal = Field(
+        default=Decimal("0.005"),
         json_schema_extra={
             "prompt_on_new": True,
-            "prompt": "Enter the spread multiplier for entry level calculation (e.g., 2.0):",
+            "prompt": "Enter the percentage for stop loss (e.g., 0.015 for 1.5%):",
         }
     )
 
@@ -101,22 +99,6 @@ class DynamicBBGridControllerConfigBase(ControllerConfigBase):
         json_schema_extra={
             "prompt_on_new": True,
             "prompt": "Enter the time limit for incomplete levels in hours (e.g., 1):",
-        }
-    )
-
-    # Final profit/stop loss levels
-    final_profit_pct: Decimal = Field(
-        default=Decimal("0.05"),
-        json_schema_extra={
-            "prompt_on_new": True,
-            "prompt": "Enter the final profit percentage (e.g., 0.05 for 5%):",
-        }
-    )
-    final_stop_loss_pct: Decimal = Field(
-        default=Decimal("0.03"),
-        json_schema_extra={
-            "prompt_on_new": True,
-            "prompt": "Enter the final stop loss percentage (e.g., 0.03 for 3%):",
         }
     )
 
@@ -151,14 +133,15 @@ class DynamicBBGridControllerConfigBase(ControllerConfigBase):
         }
     )
     stop_loss_skew: Decimal = Field(
-        default=Decimal("0.0"),
+        default=Decimal("1.0"),
         json_schema_extra={
             "prompt_on_new": True,
             "prompt": "Enter the stop loss skew multiplier (e.g., 0.0 for equal pricing):",
         }
     )
 
-    @field_validator('accumulate_pct', 'profit_pct', 'final_profit_pct', 'final_stop_loss_pct', 'profit_skew', 'stop_loss_skew')
+
+    @field_validator('accumulate_pct', 'profit_pct', 'stop_loss_pct', 'profit_skew', 'stop_loss_skew')
     def validate_percentages(cls, v):
         if v < 0 or v > 1:
             raise ValueError("Percentage values must be between 0 and 1")
@@ -189,7 +172,7 @@ class DynamicBBGridControllerBase(ControllerBase):
         # Strategy state
         self.processed_data = {"signal": 0}
         self.filled_executor_ids = set()  # Set of filled executor IDs
-        self.stop_loss_waiting_until = float('inf')  # Timestamp until which to wait after stop loss
+        self.stop_loss_waiting_until = 9999999999  # Large timestamp until which to wait after stop loss
 
         # Final level prices - updated only when orders change
         self.final_stop_loss_price = None
@@ -209,12 +192,18 @@ class DynamicBBGridControllerBase(ControllerBase):
         """
         actions = []
 
+        # Debug logging for main execution flow
+        self.logger().info(f"Backtesting Debug: determine_executor_actions called")
+
         # Check if we're in stop loss waiting period
         current_time = self.market_data_provider.time()
         if current_time < self.stop_loss_waiting_until:
+            self.logger().info(f"Backtesting Debug: In stop loss waiting period until {self.stop_loss_waiting_until}")
             return actions  # Wait and do nothing
         else:
-            self.stop_loss_waiting_until = float('inf')
+            if self.stop_loss_waiting_until != 9999999999:
+                self.logger().info(f"Backtesting Debug: Stop loss waiting period ended")
+            self.stop_loss_waiting_until = 9999999999
 
         # Update filled executor states
         self._update_executor_fill_states()
@@ -222,19 +211,26 @@ class DynamicBBGridControllerBase(ControllerBase):
         # Check and close expired executors
         expired_actions = self._check_and_close_expired_executors()
         if expired_actions:
+            self.logger().info(f"Backtesting Debug: Found {len(expired_actions)} expired executors, returning early")
             return expired_actions
 
         # Check final profit/stop loss if we have positions
-        if self._get_total_position() != Decimal("0"):
+        total_position = self._get_total_position()
+        self.logger().info(f"Backtesting Debug: Total position={total_position}")
+
+        if total_position != Decimal("0"):
+            self._update_final_stop_loss_price()
             if self._check_if_hit_final_stop_loss():
+                self.logger().info(f"Backtesting Debug: Final stop loss hit, handling")
                 return self.handle_final_stop_loss_hit()
-                
 
         # Process signals
         signal = self.processed_data.get("signal", 0)
+        self.logger().info(f"Backtesting Debug: Processing signal={signal} from processed_data")
         signal_actions = self._handle_signal(signal)
         actions.extend(signal_actions)
 
+        self.logger().info(f"Backtesting Debug: determine_executor_actions returning {len(actions)} total actions")
         return actions
 
 
@@ -245,17 +241,28 @@ class DynamicBBGridControllerBase(ControllerBase):
         actions = []
         entry_price = 0
 
+        # Debug logging for signal handling
+        self.logger().info(f"Backtesting Debug: _handle_signal called with signal={signal}")
+
         if signal == 0:
-            return actions 
+            self.logger().info(f"Backtesting Debug: Signal is 0, returning empty actions")
+            return actions
 
         # Determine trade direction
         trade_side = TradeType.BUY if signal > 0 else TradeType.SELL
         direction_buy = True if signal > 0 else False
+
+        self.logger().info(f"Backtesting Debug: Signal={signal}, Trade side={trade_side}, Direction buy={direction_buy}")
+        self.logger().info(f"Backtesting Debug: Current position={self._get_total_position()}, Current direction_buy={self.direction_buy}")
+        self.logger().info(f"Backtesting Debug: Filled executors={len(self.filled_executor_ids)}, Level number={self.config.level_number}")
+
         if self._get_total_position() == Decimal("0") and self.direction_buy != direction_buy:
+            self.logger().info(f"Backtesting Debug: Closing all positions and stopping due to direction change")
             actions.extend(self._close_all_positions_and_stop())
         else:
             # Check if all levels are filled
             if len(self.filled_executor_ids) >= self.config.level_number:
+                self.logger().info(f"Backtesting Debug: All levels filled ({len(self.filled_executor_ids)} >= {self.config.level_number}), waiting for profit/stop loss")
                 return actions  # All levels filled, wait for profit/stop loss
 
             current_price = self._get_current_price()
@@ -263,20 +270,31 @@ class DynamicBBGridControllerBase(ControllerBase):
                 entry_price = current_price * (1 - self.config.accumulate_pct)
             else:  # SELL signal
                 entry_price = current_price * (1 + self.config.accumulate_pct)
+
+            self.logger().info(f"Backtesting Debug: Current price={current_price}, Entry price={entry_price}, Accumulate pct={self.config.accumulate_pct}")
+
             # Stop all unfilled executors and create new ones
-            actions.extend(self._stop_unfilled_executor())
+            stopped_actions = self._stop_unfilled_executor()
+            self.logger().info(f"Backtesting Debug: Stopped {len(stopped_actions)} unfilled executors")
+            actions.extend(stopped_actions)
 
         self.direction_buy = direction_buy
         # Create new unfilled levels
         unfilled_levels_number = self.config.level_number - len(self.filled_executor_ids)
+        self.logger().info(f"Backtesting Debug: Creating {unfilled_levels_number} new executors")
+
         for level_index in range(unfilled_levels_number):
             action = self._create_level_executor(level_index, entry_price, trade_side)
             if action:
+                self.logger().info(f"Backtesting Debug: Created executor for level {level_index}")
                 actions.append(action)
+            else:
+                self.logger().warning(f"Backtesting Debug: Failed to create executor for level {level_index}")
 
         # Update final level prices after creating new levels
         # self._update_final_level_prices()
 
+        self.logger().info(f"Backtesting Debug: _handle_signal returning {len(actions)} actions")
         return actions
 
     def _create_triple_barrier_config(self, direction_buy: bool, accumulate_price: Decimal,
@@ -510,7 +528,6 @@ class DynamicBBGridControllerBase(ControllerBase):
                 controller_id=self.config.id,
                 executor_id=executor_id
             ))
-        self._reset_strategy_state()
         return actions
 
     def _reset_strategy_state(self):
