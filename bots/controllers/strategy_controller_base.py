@@ -143,6 +143,7 @@ class StrategyControllerBase(ControllerBase):
         self.strategy_start_time = None  # Will be set in first update cycle
         self.processed_data = {}  # Initialize processed data
         self.level_states = {}  # Track which levels are active
+        self.strategy_stopped = False  # Track if strategy has been permanently stopped
 
         # Initialize market data provider (same as PMM strategy)
         self.market_data_provider.initialize_rate_sources([
@@ -169,6 +170,7 @@ class StrategyControllerBase(ControllerBase):
         # Clear cached data that depends on configuration
         self.processed_data.clear()
         self.level_states.clear()
+        self.strategy_stopped = False  # Reset strategy stop state on config update
 
         # Recalculate levels with new configuration
         self._calculate_final_levels()
@@ -291,17 +293,23 @@ class StrategyControllerBase(ControllerBase):
             # Calculate final levels
             self._calculate_final_levels()
 
+        # If strategy has been stopped, only return stop actions for any remaining active executors
+        if self.strategy_stopped:
+            return actions
+
         # Check time limit
         if self._check_time_limit_exceeded():
+            self.strategy_stopped = True
             return self._close_all_positions_and_stop()
 
-        # Check final profit/stop loss levels only if we have accumulated positions
+        # Check final profit/stop loss levels regardless of current position
         if self.total_accumulated_position != Decimal("0"):
             current_price = self._get_current_price()
             if self._check_final_levels_hit(current_price):
+                self.strategy_stopped = True
                 return self._close_all_positions_and_stop()
 
-        # Create executors for levels that need to be active
+        # Create executors for levels that need to be active (only if strategy not stopped)
         for level_index in range(self.config.level_number):
             level_id = f"level_{level_index}"
 
@@ -479,9 +487,12 @@ class StrategyControllerBase(ControllerBase):
         status.append("")
 
         # Strategy state
-        if hasattr(self, 'strategy_start_time') and self.strategy_start_time:
+        if getattr(self, 'strategy_stopped', False):
+            status.append("Status: STOPPED (Final levels hit)")
+        elif hasattr(self, 'strategy_start_time') and self.strategy_start_time:
             elapsed = (self.market_data_provider.time() - self.strategy_start_time) / 3600
             status.append(f"Running Time: {elapsed:.1f}h / {self.config.time_limit}h")
+            status.append("Status: ACTIVE")
         else:
             status.append("Status: Initializing...")
 
