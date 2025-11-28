@@ -54,6 +54,7 @@ class BollingerV1ControllerConfig(DirectionalTradingControllerConfigBase):
 class BollingerV1Controller(DirectionalTradingControllerBase):
     def __init__(self, config: BollingerV1ControllerConfig, *args, **kwargs):
         self.config = config
+        print(f"📊 ====================DEBUG: passed config.bb_std is: {config.bb_std}")
         self.max_records = self.config.bb_length
         if len(self.config.candles_config) == 0:
             self.config.candles_config = [CandlesConfig(
@@ -70,8 +71,28 @@ class BollingerV1Controller(DirectionalTradingControllerBase):
                                                       interval=self.config.interval,
                                                       max_records=self.max_records)
         # Add indicators
-        df.ta.bbands(length=self.config.bb_length, std=self.config.bb_std, append=True)
-        bbp = df[f"BBP_{self.config.bb_length}_{self.config.bb_std}"]
+        print(f"📊 ====================DEBUG: self.config.bb_std is: {self.config.bb_std}, and bb_length is: {self.config.bb_length} ")
+        df.ta.bbands(length=self.config.bb_length, lower_std=self.config.bb_std, upper_std=self.config.bb_std, append=True)
+        # bbp = df[f"BBP_{self.config.bb_length}_{self.config.bb_std}_{self.config.bb_std}"]
+
+        # The correct BBP column format is BBP_{length}_{lower_std}_{upper_std}
+        bbp_col = f"BBP_{self.config.bb_length}_{self.config.bb_std}_{self.config.bb_std}"
+        print(f"📊 DEBUG: Looking for BBP column: {bbp_col}")
+        print(f"📊 DEBUG: Available columns after bbands: {list(df.columns)}")
+
+        if bbp_col in df.columns:
+            bbp = df[bbp_col]
+            print(f"📊 DEBUG: Successfully found BBP column: {bbp_col}")
+        else:
+            # Fallback: find any BBP column
+            possible_bbp_cols = [col for col in df.columns if 'BBP' in col]
+            if possible_bbp_cols:
+                bbp_col = possible_bbp_cols[0]
+                bbp = df[bbp_col]
+                print(f"📊 DEBUG: Using fallback BBP column: {bbp_col}")
+            else:
+                print(f"📊 ERROR: No BBP column found! Available columns: {list(df.columns)}")
+                raise KeyError(f"BBP column not found. Available columns: {list(df.columns)}")
 
         # Generate signal
         long_condition = bbp < self.config.bb_long_threshold

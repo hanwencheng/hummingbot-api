@@ -59,13 +59,26 @@ from config import settings
 
 
 # Set up logging configuration
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
-)
+import os
 
-# Enable debug logging for MQTT manager
-logging.getLogger('services.mqtt_manager').setLevel(logging.DEBUG)
+# Check if running in development mode
+is_development = os.getenv('HUMMINGBOT_LOGGING_LEVEL') == 'DEBUG'
+
+if is_development:
+    # Use detailed logging for development
+    from logging_config import setup_development_logging
+    setup_development_logging()
+else:
+    # Use standard logging for production
+    logging.basicConfig(
+        level=logging.INFO,
+        format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+    )
+
+    # Enable debug logging for specific components in production
+    logging.getLogger('services.mqtt_manager').setLevel(logging.DEBUG)
+    logging.getLogger('hummingbot.strategy_v2.backtesting').setLevel(logging.DEBUG)
+    logging.getLogger('hummingbot.strategy_v2.backtesting.backtesting_engine_base').setLevel(logging.DEBUG)
 
 
 # Get settings from Pydantic Settings
