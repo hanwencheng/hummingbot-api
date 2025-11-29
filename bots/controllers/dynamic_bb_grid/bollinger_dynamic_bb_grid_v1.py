@@ -111,7 +111,7 @@ class BollingerDynamicBBGridV1Controller(DynamicBBGridControllerBase):
 
     def __init__(self, config: BollingerDynamicBBGridV1Config, *args, **kwargs):
         self.config = config
-        self.max_records = self.config.bb_length + 10  # Extra buffer for BB calculation
+        self.max_records = self.config.bb_length # Extra buffer for BB calculation
 
         # Set up candles config if not provided
         if len(self.config.candles_config) == 0:
@@ -158,67 +158,40 @@ class BollingerDynamicBBGridV1Controller(DynamicBBGridControllerBase):
                 append=True
             )
 
-            # Get BBP (Bollinger Band Position) - shows where price is within bands
-            bbp_col = f"BBP_{self.config.bb_length}_{self.config.bb_std}_{self.config.bb_std}"
-
-            if bbp_col not in df.columns:
-                # Fallback: look for any BBP column
-                bbp_cols = [col for col in df.columns if 'BBP' in col]
-                if not bbp_cols:
-                    self.logger().error(f"Backtesting Debug: No BBP column found. Available columns: {list(df.columns)}")
-                    self.processed_data = {"signal": 0, "features": df}
-                    return
-                bbp_col = bbp_cols[0]
-                self.logger().warning(f"Backtesting Debug: Using fallback BBP column: {bbp_col}")
-
-            bbp = df[bbp_col].iloc[-1]  # Get latest BBP value
             current_price = self._get_current_price()
+            bbp_col = f"BBP_{self.config.bb_length}_{self.config.bb_std}_{self.config.bb_std}"
+            print(f"📊 DEBUG: Looking for BBP column: {bbp_col}")
+            print(f"📊 DEBUG: Available columns after bbands: {list(df.columns)}")
 
-            # Debug logging for BBP and thresholds
-            self.logger().info(f"Backtesting Debug: BBP={bbp:.4f}, Long threshold={self.config.bb_long_threshold}, Short threshold={self.config.bb_short_threshold}, Price={current_price}")
+            if bbp_col in df.columns:
+                bbp = df[bbp_col]
+                print(f"📊 DEBUG: Successfully found BBP column: {bbp_col}")
+            else:
+                # Fallback: find any BBP column
+                possible_bbp_cols = [col for col in df.columns if 'BBP' in col]
+                if possible_bbp_cols:
+                    bbp_col = possible_bbp_cols[0]
+                    bbp = df[bbp_col]
+                    print(f"📊 DEBUG: Using fallback BBP column: {bbp_col}")
+                else:
+                    print(f"📊 ERROR: No BBP column found! Available columns: {list(df.columns)}")
+                    raise KeyError(f"BBP column not found. Available columns: {list(df.columns)}")
+        
 
             # Generate signal based on BBP thresholds
             # BUY signals (oversold condition) and SELL signals (overbought condition)
-            if bbp < self.config.bb_long_threshold:
-                signal = 1  # BUY (oversold)
-                self.logger().info(f"Backtesting Debug: BUY signal generated - BBP {bbp:.4f} < {self.config.bb_long_threshold}")
-            elif bbp > self.config.bb_short_threshold:
-                signal = -1  # SELL (overbought)
-                self.logger().info(f"Backtesting Debug: SELL signal generated - BBP {bbp:.4f} > {self.config.bb_short_threshold}")
-            else:
-                signal = 0  # HOLD (neutral zone)
-                self.logger().info(f"Backtesting Debug: HOLD signal - BBP {bbp:.4f} in neutral zone ({self.config.bb_long_threshold} to {self.config.bb_short_threshold})")
+            long_condition = bbp < self.config.bb_long_threshold
+            short_condition = bbp > self.config.bb_short_threshold
+            df["signal"] = 0
+            df.loc[long_condition, "signal"] = 1
+            df.loc[short_condition, "signal"] = -1
 
             # Store processed data
             self.processed_data = {
-                "signal": signal,
+                "signal": df["signal"].iloc[-1],
                 "features": df,
-                "bbp": bbp,
-                "bb_long_threshold": self.config.bb_long_threshold,
-                "bb_short_threshold": self.config.bb_short_threshold,
                 "current_price": current_price
             }
-
-            # Log signal for debugging
-            if signal != 0:
-                if signal > 0:
-                    signal_type = "BUY"
-                    threshold = self.config.bb_long_threshold
-                    entry_price = current_price * (1 - self.config.accumulate_pct)
-                    condition = f"BBP: {bbp:.3f} < {threshold}"
-                else:
-                    signal_type = "SELL"
-                    threshold = self.config.bb_short_threshold
-                    entry_price = current_price * (1 + self.config.accumulate_pct)
-                    condition = f"BBP: {bbp:.3f} > {threshold}"
-
-                self.logger().info(
-                    f"Dynamic BB-Grid {signal_type} Signal | {condition} | "
-                    f"Price: {current_price} | Entry will be: {entry_price}"
-                )
-            else:
-                # Log even when signal is 0 during backtesting for debugging
-                self.logger().info(f"Backtesting Debug: No signal - BBP {bbp:.4f} between thresholds {self.config.bb_long_threshold} and {self.config.bb_short_threshold}")
 
         except Exception as e:
             self.logger().error(f"Error updating processed data: {e}")

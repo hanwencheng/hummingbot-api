@@ -71,6 +71,12 @@ class DynamicBBGridControllerConfigBase(ControllerConfigBase):
             "prompt": "Enter the quote asset amount for each level:",
         }
     )
+    cooldown_time: int = Field(
+        default=60 * 5, gt=0,
+        json_schema_extra={
+            "prompt": "Enter the cooldown time in seconds after executing a signal (e.g., 300 for 5 minutes): ",
+            "prompt_on_new": True, "is_updatable": True},
+    )
     accumulate_pct: Decimal = Field(
         default=Decimal("0.005"),
         json_schema_extra={
@@ -172,7 +178,8 @@ class DynamicBBGridControllerBase(ControllerBase):
         # Strategy state
         self.processed_data = {"signal": 0}
         self.filled_executor_ids = set()  # Set of filled executor IDs
-        self.stop_loss_waiting_until = 9999999999  # Large timestamp until which to wait after stop loss
+        self.stop_loss_waiting_until = 0  # Large timestamp until which to wait after stop loss
+        self.last_executor_creation_time = 0  # Track last time executors were created for cooldown
 
         # Final level prices - updated only when orders change
         self.final_stop_loss_price = None
@@ -192,18 +199,15 @@ class DynamicBBGridControllerBase(ControllerBase):
         """
         actions = []
 
-        # Debug logging for main execution flow
-        self.logger().info(f"Backtesting Debug: determine_executor_actions called")
-
         # Check if we're in stop loss waiting period
         current_time = self.market_data_provider.time()
         if current_time < self.stop_loss_waiting_until:
-            self.logger().info(f"Backtesting Debug: In stop loss waiting period until {self.stop_loss_waiting_until}")
+            self.logger().info(f"current time is: {self.market_data_provider.time()} Waiting {self.config.stop_loss_waiting_time_hours} miliseconds before next signal.")
             return actions  # Wait and do nothing
         else:
-            if self.stop_loss_waiting_until != 9999999999:
+            if self.stop_loss_waiting_until != 0:
                 self.logger().info(f"Backtesting Debug: Stop loss waiting period ended")
-            self.stop_loss_waiting_until = 9999999999
+                self.stop_loss_waiting_until = 0
 
         # Update filled executor states
         self._update_executor_fill_states()
@@ -216,7 +220,6 @@ class DynamicBBGridControllerBase(ControllerBase):
 
         # Check final profit/stop loss if we have positions
         total_position = self._get_total_position()
-        self.logger().info(f"Backtesting Debug: Total position={total_position}")
 
         if total_position != Decimal("0"):
             self._update_final_stop_loss_price()
@@ -225,28 +228,42 @@ class DynamicBBGridControllerBase(ControllerBase):
                 return self.handle_final_stop_loss_hit()
 
         # Process signals
-        signal = self.processed_data.get("signal", 0)
-        self.logger().info(f"Backtesting Debug: Processing signal={signal} from processed_data")
+        signal = self.processed_data["signal"]
         signal_actions = self._handle_signal(signal)
         actions.extend(signal_actions)
 
-        self.logger().info(f"Backtesting Debug: determine_executor_actions returning {len(actions)} total actions")
         return actions
 
+    def _check_cooldown_time(self) -> bool:
+        """
+        Check if enough time has passed since last executor creation.
+
+        Returns:
+            bool: True if cooldown period has passed, False otherwise
+        """
+        current_time = self.market_data_provider.time()
+        time_since_last_signal = current_time - self.last_executor_creation_time
+
+        if time_since_last_signal >= self.config.cooldown_time:
+            return True
+        else:
+            remaining_cooldown = self.config.cooldown_time - time_since_last_signal
+            self.logger().info(f"Backtesting Debug: Still in cooldown period. {remaining_cooldown:.1f}s remaining")
+            return False
 
     def _handle_signal(self, signal: int) -> List[ExecutorAction]:
         """
         Handle new signal with dynamic level management.
         """
         actions = []
+
+
         entry_price = 0
 
-        # Debug logging for signal handling
-        self.logger().info(f"Backtesting Debug: _handle_signal called with signal={signal}")
-
         if signal == 0:
-            self.logger().info(f"Backtesting Debug: Signal is 0, returning empty actions")
             return actions
+
+        self.logger().info(f"Backtesting Debug: _handle_signal called with signal={signal}")
 
         # Determine trade direction
         trade_side = TradeType.BUY if signal > 0 else TradeType.SELL
@@ -256,7 +273,8 @@ class DynamicBBGridControllerBase(ControllerBase):
         self.logger().info(f"Backtesting Debug: Current position={self._get_total_position()}, Current direction_buy={self.direction_buy}")
         self.logger().info(f"Backtesting Debug: Filled executors={len(self.filled_executor_ids)}, Level number={self.config.level_number}")
 
-        if self._get_total_position() == Decimal("0") and self.direction_buy != direction_buy:
+        #========= close unfilled levels
+        if self._get_total_position() != Decimal("0") and self.direction_buy != direction_buy:
             self.logger().info(f"Backtesting Debug: Closing all positions and stopping due to direction change")
             actions.extend(self._close_all_positions_and_stop())
         else:
@@ -279,17 +297,26 @@ class DynamicBBGridControllerBase(ControllerBase):
             actions.extend(stopped_actions)
 
         self.direction_buy = direction_buy
-        # Create new unfilled levels
+
+        #========= Check cooldown time before creating new executors
+        if not self._check_cooldown_time():
+            self.logger().info(f"Backtesting Debug: Skipping executor creation due to cooldown")
+            return actions
+
+        #========= Create new unfilled levels
         unfilled_levels_number = self.config.level_number - len(self.filled_executor_ids)
         self.logger().info(f"Backtesting Debug: Creating {unfilled_levels_number} new executors")
 
         for level_index in range(unfilled_levels_number):
             action = self._create_level_executor(level_index, entry_price, trade_side)
             if action:
-                self.logger().info(f"Backtesting Debug: Created executor for level {level_index}")
+                self.logger().info(f"Backtesting Debug: Created executor for level {level_index} and trade side is: {trade_side}")
                 actions.append(action)
-            else:
-                self.logger().warning(f"Backtesting Debug: Failed to create executor for level {level_index}")
+
+        # Update last signal time when executors are created
+        if actions:
+            self.last_executor_creation_time = self.market_data_provider.time()
+            self.logger().info(f"Backtesting Debug: Updated last_signal_time, next signal allowed after {self.config.cooldown_time}s cooldown")
 
         # Update final level prices after creating new levels
         # self._update_final_level_prices()
@@ -337,7 +364,7 @@ class DynamicBBGridControllerBase(ControllerBase):
             direction_multiplier = 1 if trade_side == TradeType.BUY else -1
             # Calculate amount
             final_profit_level = entry_price * (
-                1 + direction_multiplier * self.config.level_number * self.config.profit_level_pct
+                1 + direction_multiplier * self.config.level_number * self.config.profit_pct
             )
 
             final_accumulate_price = entry_price * (
@@ -354,7 +381,7 @@ class DynamicBBGridControllerBase(ControllerBase):
 
             # Calculate profit level price
             profit_price = final_profit_level - (
-                level_index * self.config.profit_level_pct * entry_price *
+                level_index * self.config.profit_pct * entry_price *
                 direction_multiplier * self.config.profit_skew
             )
 
@@ -418,27 +445,14 @@ class DynamicBBGridControllerBase(ControllerBase):
 
     def _update_executor_fill_states(self):
         """Update filled executor states based on accumulation order fill status"""
-        newly_filled_ids = []
+        self.filled_executor_ids.clear()
         for executor in self.executors_info:
-            if executor.id not in self.filled_executor_ids:
-                # Check if accumulation order has been filled (partially or completely)
-                if executor.filled_amount_quote > 0:
-                    # Accumulation order has started filling
-                    self.filled_executor_ids.add(executor.id)
-                    newly_filled_ids.append(executor.id)
-
-        if newly_filled_ids:
-            self.logger().info(f"Newly filled executors (accumulation orders filled): {newly_filled_ids}. Total filled: {len(self.filled_executor_ids)}")
-
-    def _is_executor_filled(self, executor_id: str) -> bool:
-        """Check if specific executor is filled"""
-        return executor_id in self.filled_executor_ids
-
-    def _mark_executor_filled(self, executor_id: str):
-        """Mark specific executor as filled"""
-        if executor_id not in self.filled_executor_ids:
-            self.filled_executor_ids.add(executor_id)
-            self.logger().info(f"Executor {executor_id} marked as filled")
+            if executor.is_trading:
+                # Accumulation order has started filling
+                self.filled_executor_ids.add(executor.id)
+            if executor.net_pnl_pct < 0:
+                self.logger().info(f"stop loss called for this executor with is net_pnl_quote: {executor.net_pnl_quote}, net_pnl_pct: {executor.net_pnl_pct}, close type: {executor.close_type}, close timestamp: {executor.close_timestamp}")
+        self.logger().info(f"current executors number is {len(self.executors_info)}")
 
     def _check_and_close_expired_executors(self) -> List[ExecutorAction]:
         """Check for expired executors and close them"""
