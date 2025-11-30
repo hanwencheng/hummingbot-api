@@ -172,9 +172,7 @@ class BollingerDynamicBBGridV1Controller(DynamicBBGridControllerBase):
                 if possible_bbp_cols:
                     bbp_col = possible_bbp_cols[0]
                     bbp = df[bbp_col]
-                    print(f"📊 DEBUG: Using fallback BBP column: {bbp_col}")
                 else:
-                    print(f"📊 ERROR: No BBP column found! Available columns: {list(df.columns)}")
                     raise KeyError(f"BBP column not found. Available columns: {list(df.columns)}")
         
 

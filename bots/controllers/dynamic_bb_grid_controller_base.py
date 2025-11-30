@@ -180,6 +180,7 @@ class DynamicBBGridControllerBase(ControllerBase):
         self.filled_executor_ids = set()  # Set of filled executor IDs
         self.stop_loss_waiting_until = 0  # Large timestamp until which to wait after stop loss
         self.last_executor_creation_time = 0  # Track last time executors were created for cooldown
+        self.most_recent_stop_loss_time = 0
 
         # Final level prices - updated only when orders change
         self.final_stop_loss_price = None
@@ -199,16 +200,6 @@ class DynamicBBGridControllerBase(ControllerBase):
         """
         actions = []
 
-        # Check if we're in stop loss waiting period
-        current_time = self.market_data_provider.time()
-        if current_time < self.stop_loss_waiting_until:
-            self.logger().info(f"current time is: {self.market_data_provider.time()} Waiting {self.config.stop_loss_waiting_time_hours} miliseconds before next signal.")
-            return actions  # Wait and do nothing
-        else:
-            if self.stop_loss_waiting_until != 0:
-                self.logger().info(f"Backtesting Debug: Stop loss waiting period ended")
-                self.stop_loss_waiting_until = 0
-
         # Update filled executor states
         self._update_executor_fill_states()
 
@@ -221,11 +212,15 @@ class DynamicBBGridControllerBase(ControllerBase):
         # Check final profit/stop loss if we have positions
         total_position = self._get_total_position()
 
-        if total_position != Decimal("0"):
-            self._update_final_stop_loss_price()
-            if self._check_if_hit_final_stop_loss():
-                self.logger().info(f"Backtesting Debug: Final stop loss hit, handling")
-                return self.handle_final_stop_loss_hit()
+        if self._check_if_hit_final_stop_loss():
+            self.logger().info(f"Backtesting Debug: Final stop loss hit, waiting")
+            actions.append(self.handle_stop_loss_hit())
+            return actions
+
+        #========= Check cooldown time before creating new executors
+        if not self._check_cooldown_time():
+            self.logger().info(f"Backtesting Debug: Skipping executor creation due to cooldown")
+            return actions
 
         # Process signals
         signal = self.processed_data["signal"]
@@ -256,7 +251,6 @@ class DynamicBBGridControllerBase(ControllerBase):
         Handle new signal with dynamic level management.
         """
         actions = []
-
 
         entry_price = 0
 
@@ -298,11 +292,6 @@ class DynamicBBGridControllerBase(ControllerBase):
 
         self.direction_buy = direction_buy
 
-        #========= Check cooldown time before creating new executors
-        if not self._check_cooldown_time():
-            self.logger().info(f"Backtesting Debug: Skipping executor creation due to cooldown")
-            return actions
-
         #========= Create new unfilled levels
         unfilled_levels_number = self.config.level_number - len(self.filled_executor_ids)
         self.logger().info(f"Backtesting Debug: Creating {unfilled_levels_number} new executors")
@@ -323,6 +312,11 @@ class DynamicBBGridControllerBase(ControllerBase):
 
         self.logger().info(f"Backtesting Debug: _handle_signal returning {len(actions)} actions")
         return actions
+
+    def handle_stop_loss_hit(self) -> List[ExecutorAction]:
+        actions = []
+        actions.append(self._close_all_positions_and_stop())
+        return actions    
 
     def _create_triple_barrier_config(self, direction_buy: bool, accumulate_price: Decimal,
                                       profit_price: Decimal, stop_loss_price: Decimal) -> TripleBarrierConfig:
@@ -431,7 +425,7 @@ class DynamicBBGridControllerBase(ControllerBase):
         """Get list of unfilled (active) executor IDs"""
         unfilled_ids = []
         for executor in self.executors_info:
-            if executor.is_active and executor.id in self.filled_executor_ids:
+            if executor.is_trading and executor.id in self.filled_executor_ids:
                 unfilled_ids.append(executor.id)
         return unfilled_ids
     
@@ -450,9 +444,6 @@ class DynamicBBGridControllerBase(ControllerBase):
             if executor.is_trading:
                 # Accumulation order has started filling
                 self.filled_executor_ids.add(executor.id)
-            if executor.net_pnl_pct < 0:
-                self.logger().info(f"stop loss called for this executor with is net_pnl_quote: {executor.net_pnl_quote}, net_pnl_pct: {executor.net_pnl_pct}, close type: {executor.close_type}, close timestamp: {executor.close_timestamp}")
-        self.logger().info(f"current executors number is {len(self.executors_info)}")
 
     def _check_and_close_expired_executors(self) -> List[ExecutorAction]:
         """Check for expired executors and close them"""
@@ -492,43 +483,37 @@ class DynamicBBGridControllerBase(ControllerBase):
         remaining_seconds = time_limit_seconds - executor_age
 
         return max(0.0, remaining_seconds / 3600)
-
     def _check_if_hit_final_stop_loss(self) -> bool:
-        """Check if final profit or stop loss levels have been hit and handle them"""
-        if self.final_stop_loss_price is None:
-            return False
+        """Check if we should enter stop loss waiting period based on recent executor closures"""
+        current_time = self.market_data_provider.time()
 
-        current_price = self._get_current_price()
-        if current_price == Decimal("0"):
-            return False
+        # Find the most recent stop loss closure
+        for executor in self.executors_info:
+            if executor.close_type == CloseType.STOP_LOSS:
+                # Use close_timestamp if available, otherwise fall back to timestamp
+                executor_close_time = getattr(executor, 'close_timestamp', 0)
 
-        if self.direction_buy:
-            stop_loss_hit = (self.final_stop_loss_price and
-                            current_price <= self.final_stop_loss_price)
-        else:
-            stop_loss_hit = (self.final_stop_loss_price and
-                            current_price >= self.final_stop_loss_price)
+                if executor_close_time > self.most_recent_stop_loss_time:
+                    self.most_recent_stop_loss_time = executor_close_time
 
-        return stop_loss_hit
+        # Check if enough time has passed since the most recent stop loss
+        time_since_stop_loss = current_time - self.most_recent_stop_loss_time
+        waiting_time_seconds = self.config.stop_loss_waiting_time_hours * 3600
 
-    def handle_final_stop_loss_hit(self):
-        self._close_all_positions_and_stop()
+        if time_since_stop_loss < waiting_time_seconds:
+            self.logger().info(f"Stop loss waiting period active.")
+            return True  # Still in waiting period
 
-        # If stop loss hit, set waiting time
-        self.stop_loss_waiting_until = (
-            self.market_data_provider.time() +
-            self.config.stop_loss_waiting_time_hours * 3600
-        )
-        self.logger().info(f"Stop loss hit at {self.final_stop_loss_price} (final SL: {self.final_stop_loss_price}). Waiting {self.config.stop_loss_waiting_time_hours} hours before next signal.")
-        self._reset_strategy_state()
+        return False  # Waiting period over, can proceed
 
     def _close_all_positions_and_stop(self) -> List[ExecutorAction]:
         """Close all active positions"""
         actions = []
         for executor in self.executors_info:
-            if executor.is_active:
+            if executor.is_trading or executor.is_active:
                 actions.append(StopExecutorAction(
                     controller_id=self.config.id,
+                    keep_position=False,
                     executor_id=executor.id
                 ))
         self._reset_strategy_state()
@@ -584,24 +569,6 @@ class DynamicBBGridControllerBase(ControllerBase):
                 total_amount += executor.amount
 
         return total_value / total_amount if total_amount > 0 else Decimal("0")
-
-    def _update_final_stop_loss_price(self):
-        """Update final level prices based on active executors"""
-        final_stop_loss_price = None
-        filled_executor_ids = self._get_filled_executor_ids();
-        direction_multiplier = 1 if self.direction_buy else -1
-
-        for executor in self.executors_info:
-            if executor.is_active and executor.id in filled_executor_ids:
-                # Calculate stop loss price for this level
-                if "stop_loss_price" in executor.custom_info:
-                    stop_loss_price = executor.custom_info.get("stop_loss_price")
-                    if final_stop_loss_price is None or stop_loss_price * direction_multiplier < final_stop_loss_price * direction_multiplier:
-                        final_stop_loss_price = float(stop_loss_price)
-                else:
-                    self.logger().error("no stop loss price in the executor config")
-
-        self.final_stop_loss_price = final_stop_loss_price
 
     async def update_processed_data(self):
         """
