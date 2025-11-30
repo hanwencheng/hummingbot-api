@@ -59,29 +59,8 @@ class OrdersRecorder:
         # Subscribe to order events using the same pattern as MarketsRecorder
         for event, forwarder in self._event_pairs:
             connector.add_listener(event, forwarder)
-            logger.info(f"OrdersRecorder: Added listener for {event} with forwarder {forwarder}")
-            
-            # Debug: Check if listeners were actually added
-            if hasattr(connector, '_event_listeners'):
-                listeners = connector._event_listeners.get(event, [])
-                logger.info(f"OrdersRecorder: Event {event} now has {len(listeners)} listeners")
-                for i, listener in enumerate(listeners):
-                    logger.info(f"OrdersRecorder: Listener {i}: {listener}")
         
-        logger.info(f"OrdersRecorder started for {self.account_name}/{self.connector_name} with {len(self._event_pairs)} event listeners")
-        
-        # Debug: Print connector info
-        logger.info(f"OrdersRecorder: Connector type: {type(connector)}")
-        logger.info(f"OrdersRecorder: Connector name: {getattr(connector, 'name', 'unknown')}")
-        logger.info(f"OrdersRecorder: Connector ready: {getattr(connector, 'ready', 'unknown')}")
-        
-        # Test if forwarders are callable
-        for event, forwarder in self._event_pairs:
-            if callable(forwarder):
-                logger.info(f"OrdersRecorder: Forwarder for {event} is callable")
-            else:
-                logger.error(f"OrdersRecorder: Forwarder for {event} is NOT callable: {type(forwarder)}")
-    
+
     async def stop(self):
         """Stop recording orders"""
         if self._connector:
@@ -89,8 +68,6 @@ class OrdersRecorder:
             for event, forwarder in self._event_pairs:
                 self._connector.remove_listener(event, forwarder)
             
-        logger.info(f"OrdersRecorder stopped for {self.account_name}/{self.connector_name}")
-    
     def _extract_error_message(self, event) -> str:
         """Extract error message from various possible event attributes."""
         # Try different possible attribute names for error messages

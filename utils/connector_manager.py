@@ -336,8 +336,6 @@ class ConnectorManager:
             if hasattr(connector, '_update_order_status') and connector.in_flight_orders:
                 await connector._update_order_status()
                 
-            logger.debug(f"Updated connector state for {connector_name}")
-            
         except Exception as e:
             logger.error(f"Error updating connector state for {connector_name}: {e}")
 

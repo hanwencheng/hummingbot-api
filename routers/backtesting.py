@@ -75,13 +75,6 @@ async def run_backtesting(backtesting_config: BacktestingConfig):
 
             logger.warning("Backtesting engine execution completed successfully")
 
-            # Detailed backtesting results logging
-            results_summary = {
-                "keys": list(backtesting_results.keys()),
-                "executors_count": len(backtesting_results['executors']),
-                "processed_data_shape": str(backtesting_results['processed_data']['features'].shape),
-                "results": backtesting_results['results']
-            }
         except Exception as e:
             logger.warning(f"Backtesting engine error: {str(e)}")
             logger.warning(f"Error type: {type(e)}")
