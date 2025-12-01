@@ -314,12 +314,20 @@ class StrategyControllerBase(ControllerBase):
             level_id = f"level_{level_index}"
 
             # Check if this level already has an active executor
-            if not self._has_active_executor(level_id):
+            if not self._has_active_executor(level_id) and self._can_create_executor():
                 action = self._create_level_executor(level_index)
                 if action:
                     actions.append(action)
 
         return actions
+
+    def _can_create_executor(self) -> bool:
+        current_price = self._get_current_price()
+        if self.config.direction_buy and current_price < self.config.entry_price:
+            return False
+        if not self.config.direction_buy and current_price > self.config.entry_price:
+            return False
+        return True
 
     def _has_active_executor(self, level_id: str) -> bool:
         """Check if there's an active executor for this level"""
