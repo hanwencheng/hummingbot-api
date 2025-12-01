@@ -185,6 +185,7 @@ class DynamicBBGridControllerBase(ControllerBase):
         # Final level prices - updated only when orders change
         self.final_stop_loss_price = None
         self.direction_buy = True
+        self.reverse_order_open = False
 
         # Initialize market data provider
         self.market_data_provider.initialize_rate_sources([
@@ -209,13 +210,15 @@ class DynamicBBGridControllerBase(ControllerBase):
             self.logger().info(f"Backtesting Debug: Found {len(expired_actions)} expired executors, returning early")
             return expired_actions
 
-        # Check final profit/stop loss if we have positions
-        total_position = self._get_total_position()
-
         if self._check_if_hit_final_stop_loss():
             self.logger().info(f"Backtesting Debug: Final stop loss hit, waiting")
             actions.append(self.handle_stop_loss_hit())
             return actions
+        else:
+            if self.reverse_order_open:
+                actions.append(self._close_all_positions_and_stop())
+                self.reverse_order_open = False
+                return actions
 
         #========= Check cooldown time before creating new executors
         if not self._check_cooldown_time():
@@ -261,6 +264,7 @@ class DynamicBBGridControllerBase(ControllerBase):
 
         # Determine trade direction
         trade_side = TradeType.BUY if signal > 0 else TradeType.SELL
+        self.logger().info(f"Backtesting Debug: trade side is ={trade_side}")
         direction_buy = True if signal > 0 else False
 
         self.logger().info(f"Backtesting Debug: Signal={signal}, Trade side={trade_side}, Direction buy={direction_buy}")
@@ -297,7 +301,7 @@ class DynamicBBGridControllerBase(ControllerBase):
         self.logger().info(f"Backtesting Debug: Creating {unfilled_levels_number} new executors")
 
         for level_index in range(unfilled_levels_number):
-            action = self._create_level_executor(level_index, entry_price, trade_side)
+            action = self._create_level_executor(level_index, entry_price, trade_side, False)
             if action:
                 self.logger().info(f"Backtesting Debug: Created executor for level {level_index} and trade side is: {trade_side}")
                 actions.append(action)
@@ -315,7 +319,17 @@ class DynamicBBGridControllerBase(ControllerBase):
 
     def handle_stop_loss_hit(self) -> List[ExecutorAction]:
         actions = []
-        actions.append(self._close_all_positions_and_stop())
+        if not self.reverse_order_open:
+            actions.append(self._close_all_positions_and_stop())
+            current_price = self._get_current_price()
+            trade_side = TradeType.SELL if self.direction_buy else TradeType.BUY
+            # todo
+            for level_index in range(self.config.level_number):
+                action = self._create_level_executor(level_index, current_price, trade_side, True)
+                if action:
+                    self.logger().info(f"Backtesting Debug: Created executor for level {level_index} and trade side is: {trade_side}")
+                    actions.append(action)   
+            self.reverse_order_open = True
         return actions    
 
     def _create_triple_barrier_config(self, direction_buy: bool, accumulate_price: Decimal,
@@ -350,7 +364,7 @@ class DynamicBBGridControllerBase(ControllerBase):
             time_limit_order_type=OrderType.MARKET  # Time limit triggers market order
         )
 
-    def _create_level_executor(self, level_index: int, entry_price: Decimal, trade_side: TradeType) -> Optional[CreateExecutorAction]:
+    def _create_level_executor(self, level_index: int, entry_price: Decimal, trade_side: TradeType, is_reverse_order: bool) -> Optional[CreateExecutorAction]:
         """
         Create executor for specific level with given entry price and trade direction.
         """
@@ -380,10 +394,11 @@ class DynamicBBGridControllerBase(ControllerBase):
             )
 
             # Calculate stop loss level price
-            stop_loss_price = final_stop_loss_level + (
-                level_index * self.config.stop_loss_pct * entry_price *
-                direction_multiplier * self.config.stop_loss_skew
-            )
+            # stop_loss_price = final_stop_loss_level + (
+            #     level_index * self.config.stop_loss_pct * entry_price *
+            #     direction_multiplier * self.config.stop_loss_skew
+            # )
+            stop_loss_price = final_stop_loss_level
 
             # Create triple barrier configuration
             triple_barrier = self._create_triple_barrier_config(trade_side == TradeType.BUY, 
@@ -402,7 +417,7 @@ class DynamicBBGridControllerBase(ControllerBase):
                 amount=amount,
                 triple_barrier_config=triple_barrier,
                 leverage=self.config.leverage,
-                stop_loss_price=f"{stop_loss_price}"
+                is_reverse_order=is_reverse_order
             )
 
             return CreateExecutorAction(
