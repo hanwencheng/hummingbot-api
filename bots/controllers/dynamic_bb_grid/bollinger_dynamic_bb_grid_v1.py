@@ -15,6 +15,7 @@ import pandas_ta as ta  # noqa: F401
 from pydantic import Field, field_validator
 from pydantic_core.core_schema import ValidationInfo
 
+from hummingbot.core.data_type.common import PriceType
 from hummingbot.data_feed.candles_feed.data_types import CandlesConfig
 from hummingbot.strategy_v2.models.executors import CloseType
 from bots.controllers.dynamic_bb_grid_controller_base import (
@@ -111,7 +112,7 @@ class BollingerDynamicBBGridV1Controller(DynamicBBGridControllerBase):
 
     def __init__(self, config: BollingerDynamicBBGridV1Config, *args, **kwargs):
         self.config = config
-        self.max_records = self.config.bb_length # Extra buffer for BB calculation
+        self.max_records = self.config.bb_length + 20 # Extra buffer for BB calculation
 
         # Set up candles config if not provided
         if len(self.config.candles_config) == 0:
@@ -119,7 +120,7 @@ class BollingerDynamicBBGridV1Controller(DynamicBBGridControllerBase):
                 connector=config.candles_connector,
                 trading_pair=config.candles_trading_pair,
                 interval=config.interval,
-                max_records=self.max_records
+                max_records=self.max_records 
             )]
 
         super().__init__(config, *args, **kwargs)
@@ -139,7 +140,7 @@ class BollingerDynamicBBGridV1Controller(DynamicBBGridControllerBase):
             )
 
             # Debug logging for data availability
-            self.logger().info(f"Backtesting Debug: Got candles data - rows: {len(df) if df is not None else 0}, required: {self.config.bb_length}")
+            self.logger().info(f"Backtesting Debug: Got candles data - rows: {len(df) if df is not None else 0}, required: {self.config.bb_length} with interval {self.config.interval}")
 
             if df is None or len(df) < self.config.bb_length:
                 # Not enough data for BB calculation
@@ -157,24 +158,22 @@ class BollingerDynamicBBGridV1Controller(DynamicBBGridControllerBase):
                 upper_std=self.config.bb_std,
                 append=True
             )
-
-            current_price = self._get_current_price()
-            bbp_col = f"BBP_{self.config.bb_length}_{self.config.bb_std}_{self.config.bb_std}"
+            df.ta.rsi(length=14, append=True)
+            # Use close price from candle data instead of live market data (for backtesting compatibility)
+            current_price = self.market_data_provider.get_price_by_type(self.config.connector_name,self.config.trading_pair,PriceType.MidPrice)
+            self.logger().info(f'get current price: {current_price}')
+            bb_suffix = f"{self.config.bb_length}_{self.config.bb_std}_{self.config.bb_std}"
+            bbp_col = f"BBP_{bb_suffix}"
+            bbu_col = f"BBU_{bb_suffix}"
+            bbl_col = f"BBL_{bb_suffix}"
             print(f"📊 DEBUG: Looking for BBP column: {bbp_col}")
             print(f"📊 DEBUG: Available columns after bbands: {list(df.columns)}")
-
-            if bbp_col in df.columns:
-                bbp = df[bbp_col]
-                print(f"📊 DEBUG: Successfully found BBP column: {bbp_col}")
-            else:
-                # Fallback: find any BBP column
-                possible_bbp_cols = [col for col in df.columns if 'BBP' in col]
-                if possible_bbp_cols:
-                    bbp_col = possible_bbp_cols[0]
-                    bbp = df[bbp_col]
-                else:
-                    raise KeyError(f"BBP column not found. Available columns: {list(df.columns)}")
-        
+            bbp = df[bbp_col]
+            rsi = df["RSI_14"]
+            bbu = df[bbu_col]
+            bbl = df[bbl_col]
+            print(f"📊 DEBUG: BBP column is: {bbp}")
+            calculated_bbp = (float(current_price) - bbl)/(bbu-bbl)
 
             # Generate signal based on BBP thresholds
             # BUY signals (oversold condition) and SELL signals (overbought condition)
@@ -188,7 +187,8 @@ class BollingerDynamicBBGridV1Controller(DynamicBBGridControllerBase):
             self.processed_data = {
                 "signal": df["signal"].iloc[-1],
                 "features": df,
-                "current_price": current_price
+                "bbp": calculated_bbp.iloc[-1],
+                "reference_price": current_price
             }
 
         except Exception as e:

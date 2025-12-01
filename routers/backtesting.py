@@ -1,5 +1,6 @@
 import json
 import logging
+from datetime import datetime
 from fastapi import APIRouter
 from hummingbot.data_feed.candles_feed.candles_factory import CandlesFactory
 from hummingbot.strategy_v2.backtesting.backtesting_engine_base import BacktestingEngineBase
@@ -104,6 +105,44 @@ async def run_backtesting(backtesting_config: BacktestingConfig):
                 "first_few_rows": backtesting_results['processed_data']['features'].head().to_dict()
             }
             logger.warning(f"Processed data sample JSON: {json.dumps(data_sample, indent=2, default=str)}")
+
+            # Debug: List each row with timestamp, BBP, and signal in readable format
+            df = backtesting_results['processed_data']['features']
+            if 'BBP_20_2.0_2.0' in df.columns and 'signal' in df.columns:
+                logger.warning("=== DEBUG: Timestamp, BBP, Signal Analysis ===")
+
+                for idx, row in df.iterrows():
+                    # Convert timestamp to human readable
+                    if isinstance(idx, (int, float)):
+                        # If index is timestamp
+                        readable_time = datetime.fromtimestamp(idx).strftime('%Y-%m-%d %H:%M:%S')
+                        timestamp = idx
+                    elif 'timestamp' in df.columns:
+                        # If there's a timestamp column
+                        timestamp = row['timestamp']
+                        readable_time = datetime.fromtimestamp(timestamp).strftime('%Y-%m-%d %H:%M:%S')
+                    else:
+                        # Use index as timestamp
+                        timestamp = idx
+                        readable_time = str(idx)
+
+                    bbp_value = row['BBP_20_2.0_2.0']
+                    signal_value = row['signal']
+                    high = row['high']
+                    low = row['low']
+                    bbu = row['BBU_20_2.0_2.0']
+                    bbl = row['BBL_20_2.0_2.0']
+                    close_bt = row['close_bt']
+                    calculated_bbp = (close_bt - bbl)/(bbu - bbl)
+                    passed_bbp = backtesting_results['processed_data']['bbp']
+                    reference_price = backtesting_results['processed_data']['reference_price']
+
+                    logger.warning(f"Time: {readable_time} | BBP: {bbp_value:.6f}|Calculated BBP: {calculated_bbp:.6f}| Passed BBP: {passed_bbp} | Signal: {signal_value} | High: {high} | Low: {low} | BBU {bbu} | BBL: {bbl} | close: {close_bt} | reference price: {reference_price}")
+
+                logger.warning("=== END DEBUG ===")
+            else:
+                available_cols = list(df.columns)
+                logger.warning(f"BBP_20_2.0_2.0 or signal column not found. Available columns: {available_cols}")
 
         processed_data = backtesting_results["processed_data"]["features"].fillna(0)
         executors_info = [e.to_dict() for e in backtesting_results["executors"]]
