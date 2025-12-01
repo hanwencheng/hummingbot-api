@@ -126,18 +126,16 @@ async def run_backtesting(backtesting_config: BacktestingConfig):
                         timestamp = idx
                         readable_time = str(idx)
 
-                    bbp_value = row['BBP_20_2.0_2.0']
                     signal_value = row['signal']
                     high = row['high']
                     low = row['low']
                     bbu = row['BBU_20_2.0_2.0']
                     bbl = row['BBL_20_2.0_2.0']
                     close_bt = row['close_bt']
-                    calculated_bbp = (close_bt - bbl)/(bbu - bbl)
-                    passed_bbp = backtesting_results['processed_data']['bbp']
-                    reference_price = backtesting_results['processed_data']['reference_price']
+                    passed_bbp = row['bbp']
+                    rsi = row["RSI_14"]
 
-                    logger.warning(f"Time: {readable_time} | BBP: {bbp_value:.6f}|Calculated BBP: {calculated_bbp:.6f}| Passed BBP: {passed_bbp} | Signal: {signal_value} | High: {high} | Low: {low} | BBU {bbu} | BBL: {bbl} | close: {close_bt} | reference price: {reference_price}")
+                    logger.info(f"Time: {readable_time} | Signal: {signal_value} | BBP: {passed_bbp:.4f} | BBU: {bbu:.4f} | BBL: {bbl:.4f} | price: {close_bt:.4f} | rsi: {rsi}")
 
                 logger.warning("=== END DEBUG ===")
             else:

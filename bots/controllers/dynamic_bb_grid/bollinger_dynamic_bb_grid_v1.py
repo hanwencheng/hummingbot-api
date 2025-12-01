@@ -113,15 +113,16 @@ class BollingerDynamicBBGridV1Controller(DynamicBBGridControllerBase):
     def __init__(self, config: BollingerDynamicBBGridV1Config, *args, **kwargs):
         self.config = config
         self.max_records = self.config.bb_length + 20 # Extra buffer for BB calculation
-
         # Set up candles config if not provided
         if len(self.config.candles_config) == 0:
-            self.config.candles_config = [CandlesConfig(
-                connector=config.candles_connector,
-                trading_pair=config.candles_trading_pair,
-                interval=config.interval,
-                max_records=self.max_records 
-            )]
+            self.config.candles_config = [
+                CandlesConfig(
+                    connector=config.candles_connector,
+                    trading_pair=config.candles_trading_pair,
+                    interval=config.interval,
+                    max_records=self.max_records 
+                )
+            ]
 
         super().__init__(config, *args, **kwargs)
 
@@ -140,6 +141,7 @@ class BollingerDynamicBBGridV1Controller(DynamicBBGridControllerBase):
             )
 
             # Debug logging for data availability
+            self.logger().info(f"Backtesting Debug: Got candles data - rows: {len(df) if df is not None else 0}, required: {self.config.bb_length} with interval {self.config.interval}")
             self.logger().info(f"Backtesting Debug: Got candles data - rows: {len(df) if df is not None else 0}, required: {self.config.bb_length} with interval {self.config.interval}")
 
             if df is None or len(df) < self.config.bb_length:
@@ -168,27 +170,33 @@ class BollingerDynamicBBGridV1Controller(DynamicBBGridControllerBase):
             bbl_col = f"BBL_{bb_suffix}"
             print(f"📊 DEBUG: Looking for BBP column: {bbp_col}")
             print(f"📊 DEBUG: Available columns after bbands: {list(df.columns)}")
-            bbp = df[bbp_col]
             rsi = df["RSI_14"]
-            bbu = df[bbu_col]
-            bbl = df[bbl_col]
+            close_price = df["close"]
+            df["bbp"] = (df["close"] - df[bbl_col]) / (df[bbu_col] - df[bbl_col])
+            bbp = df["bbp"]
             print(f"📊 DEBUG: BBP column is: {bbp}")
-            calculated_bbp = (float(current_price) - bbl)/(bbu-bbl)
 
             # Generate signal based on BBP thresholds
             # BUY signals (oversold condition) and SELL signals (overbought condition)
-            long_condition = bbp < self.config.bb_long_threshold
-            short_condition = bbp > self.config.bb_short_threshold
+            long_condition = (
+                ((bbp < self.config.bb_long_threshold) & (rsi < 32)) |
+                ((bbp > self.config.bb_short_threshold) & (rsi < 60))
+            )
+
+            short_condition = (
+                ((bbp > self.config.bb_short_threshold) & (rsi > 68)) |
+                ((bbp < self.config.bb_long_threshold) & (rsi > 40))
+            )  
             df["signal"] = 0
-            df.loc[long_condition, "signal"] = 1
-            df.loc[short_condition, "signal"] = -1
+            df.loc[long_condition, "signal"] = -1
+            df.loc[short_condition, "signal"] = 1
+            
 
             # Store processed data
             self.processed_data = {
                 "signal": df["signal"].iloc[-1],
                 "features": df,
-                "bbp": calculated_bbp.iloc[-1],
-                "reference_price": current_price
+                "bbp": df["bbp"].iloc[-1],
             }
 
         except Exception as e:
