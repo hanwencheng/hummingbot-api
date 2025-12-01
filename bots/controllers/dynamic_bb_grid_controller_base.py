@@ -21,6 +21,7 @@ Key Logic:
 from decimal import Decimal
 from typing import Dict, List, Optional
 from pydantic import Field, field_validator
+from datetime import datetime
 
 from hummingbot.core.data_type.common import OrderType, PositionMode, TradeType, PriceType
 from hummingbot.data_feed.candles_feed.data_types import CandlesConfig
@@ -211,7 +212,6 @@ class DynamicBBGridControllerBase(ControllerBase):
             return expired_actions
 
         if self._check_if_hit_final_stop_loss():
-            self.logger().info(f"Backtesting Debug: Final stop loss hit, waiting")
             actions.append(self.handle_stop_loss_hit())
             return actions
         else:
@@ -222,7 +222,6 @@ class DynamicBBGridControllerBase(ControllerBase):
 
         #========= Check cooldown time before creating new executors
         if not self._check_cooldown_time():
-            self.logger().info(f"Backtesting Debug: Skipping executor creation due to cooldown")
             return actions
 
         # Process signals
@@ -287,7 +286,8 @@ class DynamicBBGridControllerBase(ControllerBase):
             else:  # SELL signal
                 entry_price = current_price * (1 + self.config.accumulate_pct)
 
-            self.logger().info(f"Backtesting Debug: Current price={current_price}, Entry price={entry_price}, Accumulate pct={self.config.accumulate_pct}")
+            current_timestamp = datetime.fromtimestamp(self.market_data_provider.time()).strftime('%Y-%m-%d %H:%M:%S')
+            self.logger().info(f"Backtesting Debug: Current price={current_price:.3f}, Timestamp={current_timestamp}, Entry price={entry_price:.3f}")
 
             # Stop all unfilled executors and create new ones
             stopped_actions = self._stop_unfilled_executor()
@@ -509,6 +509,7 @@ class DynamicBBGridControllerBase(ControllerBase):
                 executor_close_time = getattr(executor, 'close_timestamp', 0)
 
                 if executor_close_time > self.most_recent_stop_loss_time:
+                    self.logger().info(f"new top loss find, Stop loss waiting period active.")
                     self.most_recent_stop_loss_time = executor_close_time
 
         # Check if enough time has passed since the most recent stop loss
@@ -516,7 +517,6 @@ class DynamicBBGridControllerBase(ControllerBase):
         waiting_time_seconds = self.config.stop_loss_waiting_time_hours * 3600
 
         if time_since_stop_loss < waiting_time_seconds:
-            self.logger().info(f"Stop loss waiting period active.")
             return True  # Still in waiting period
 
         return False  # Waiting period over, can proceed
