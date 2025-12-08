@@ -269,8 +269,6 @@ class ConnectorManager:
             # Start lost orders update task
             connector._lost_orders_update_task = safe_ensure_future(connector._lost_orders_update_polling_loop())
 
-            logger.info(f"Started connector network tasks for {connector}")
-
         except Exception as e:
             logger.error(f"Error starting connector network: {e}")
             raise

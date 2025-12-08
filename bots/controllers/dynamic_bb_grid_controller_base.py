@@ -23,6 +23,9 @@ from typing import Dict, List, Optional
 from pydantic import Field, field_validator
 from datetime import datetime
 
+import pandas as pd
+import pandas_ta as ta 
+
 from hummingbot.core.data_type.common import OrderType, PositionMode, TradeType, PriceType
 from hummingbot.data_feed.candles_feed.data_types import CandlesConfig
 from hummingbot.strategy_v2.controllers.controller_base import ControllerBase, ControllerConfigBase
@@ -146,6 +149,20 @@ class DynamicBBGridControllerConfigBase(ControllerConfigBase):
             "prompt": "Enter the stop loss skew multiplier (e.g., 0.0 for equal pricing):",
         }
     )
+    bb_long_threshold: float = Field(
+        default=0.1,
+        json_schema_extra={
+            "prompt": "Enter the BBP threshold for BUY signals (e.g., 0.2 for oversold): ",
+            "prompt_on_new": True
+        }
+    )
+    bb_short_threshold: float = Field(
+        default=0.9,
+        json_schema_extra={
+            "prompt": "Enter the BBP threshold for SELL signals (e.g., 0.8 for overbought): ",
+            "prompt_on_new": True
+        }
+    )
 
 
     @field_validator('accumulate_pct', 'profit_pct', 'stop_loss_pct', 'profit_skew', 'stop_loss_skew')
@@ -208,24 +225,28 @@ class DynamicBBGridControllerBase(ControllerBase):
         # Check and close expired executors
         expired_actions = self._check_and_close_expired_executors()
         if expired_actions:
-            self.logger().info(f"Backtesting Debug: Found {len(expired_actions)} expired executors, returning early")
+            self.logger().info(f":: Found {len(expired_actions)} expired executors, returning early")
             return expired_actions
 
-        if self._check_if_hit_final_stop_loss():
-            actions.append(self.handle_stop_loss_hit())
+        has_stop_loss_hit = self._check_if_hit_final_stop_loss()
+        if has_stop_loss_hit and not self.reverse_order_open:
+            actions.extend(self.handle_stop_loss_hit())
             return actions
-        else:
-            if self.reverse_order_open:
-                actions.append(self._close_all_positions_and_stop())
-                self.reverse_order_open = False
-                return actions
+        elif not has_stop_loss_hit and self.reverse_order_open:
+            self.logger().info(f"stop loss period ended, close reverse order")
+            actions.extend(self._close_all_positions_and_stop())
+            self.reverse_order_open = False
+            return actions
+        elif has_stop_loss_hit and self.reverse_order_open:
+            self.logger().info(f"reverse order opening now")
+            return actions
+            
 
         #========= Check cooldown time before creating new executors
         if not self._check_cooldown_time():
             return actions
-
-        # Process signals
-        signal = self.processed_data["signal"]
+        
+        signal = self._calculate_signal(self.processed_data)
         signal_actions = self._handle_signal(signal)
         actions.extend(signal_actions)
 
@@ -245,8 +266,60 @@ class DynamicBBGridControllerBase(ControllerBase):
             return True
         else:
             remaining_cooldown = self.config.cooldown_time - time_since_last_signal
-            self.logger().info(f"Backtesting Debug: Still in cooldown period. {remaining_cooldown:.1f}s remaining")
+            self.logger().info(f":: No Signal Check, still in cooldown period. {remaining_cooldown:.1f}s remaining")
             return False
+
+    def _calculate_signal(self, processed_data: any):
+        signal = 0
+
+        bbu = processed_data['bbu']
+        bbl = processed_data['bbl']
+        close_bt = processed_data['close']
+        rsi = processed_data["rsi"]
+        passed_bbp = processed_data["bbp"]
+        avg_gain = processed_data["avg_gain"]
+        prev_price = processed_data["prev_price"]
+        avg_loss = processed_data["avg_loss"]
+        readable_time = datetime.fromtimestamp(processed_data["timestamp"]).strftime('%Y-%m-%d %H:%M:%S')
+        bbp = (close_bt - bbl)/(bbu - bbl)
+
+        # Calculate real-time RSI using current price and stored averages
+        realtime_rsi = self._calculate_realtime_rsi(
+            close_bt, prev_price, avg_gain, avg_loss
+        )
+
+        # not accurate if it is lower than 4% of the bbu
+
+        if bbp > self.config.bb_short_threshold:
+            signal = -1 
+        if bbp < self.config.bb_long_threshold:
+            signal = 1
+            
+        if not signal == 0:
+            self.logger().info(f"close_bt is {close_bt:.4f}, bbp is {bbp:.4f}, and bbu is {bbu:.4f}, and bbl is {bbl:.4f}")
+            self.logger().info(f"Time: {readable_time} | Signal: {signal} | BBP: {bbp:.4f} | price: {close_bt:.4f} | rsi: {realtime_rsi:.2f}")
+        return signal
+
+    def _calculate_realtime_rsi(self, current_price: Decimal, prev_price: float, prev_avg_gain: float, prev_avg_loss: float, period: int = 14) -> float:
+        # Calculate price change
+        price_change = float(current_price) - prev_price
+
+        # Separate gains and losses
+        gain = max(price_change, 0)
+        loss = max(-price_change, 0)
+
+        # Update averages using Wilder's method: new_avg = (old_avg * (n-1) + new_value) / n
+        new_avg_gain = (prev_avg_gain * (period - 1) + gain) / period
+        new_avg_loss = (prev_avg_loss * (period - 1) + loss) / period
+
+        # Calculate RSI
+        if new_avg_loss == 0:
+            rsi = 100.0
+        else:
+            rs = new_avg_gain / new_avg_loss
+            rsi = 100.0 - (100.0 / (1.0 + rs))
+
+        return rsi
 
     def _handle_signal(self, signal: int) -> List[ExecutorAction]:
         """
@@ -259,25 +332,17 @@ class DynamicBBGridControllerBase(ControllerBase):
         if signal == 0:
             return actions
 
-        self.logger().info(f"Backtesting Debug: _handle_signal called with signal={signal}")
-
-        # Determine trade direction
         trade_side = TradeType.BUY if signal > 0 else TradeType.SELL
-        self.logger().info(f"Backtesting Debug: trade side is ={trade_side}")
         direction_buy = True if signal > 0 else False
-
-        self.logger().info(f"Backtesting Debug: Signal={signal}, Trade side={trade_side}, Direction buy={direction_buy}")
-        self.logger().info(f"Backtesting Debug: Current position={self._get_total_position()}, Current direction_buy={self.direction_buy}")
-        self.logger().info(f"Backtesting Debug: Filled executors={len(self.filled_executor_ids)}, Level number={self.config.level_number}")
 
         #========= close unfilled levels
         if self._get_total_position() != Decimal("0") and self.direction_buy != direction_buy:
-            self.logger().info(f"Backtesting Debug: Closing all positions and stopping due to direction change")
+            self.logger().info(f"Important! Closing all positions and stopping due to direction change")
             actions.extend(self._close_all_positions_and_stop())
         else:
             # Check if all levels are filled
             if len(self.filled_executor_ids) >= self.config.level_number:
-                self.logger().info(f"Backtesting Debug: All levels filled ({len(self.filled_executor_ids)} >= {self.config.level_number}), waiting for profit/stop loss")
+                self.logger().info(f":: All levels filled ({len(self.filled_executor_ids)} >= {self.config.level_number}), waiting for profit/stop loss")
                 return actions  # All levels filled, wait for profit/stop loss
 
             current_price = self._get_current_price()
@@ -286,48 +351,46 @@ class DynamicBBGridControllerBase(ControllerBase):
             else:  # SELL signal
                 entry_price = current_price * (1 + self.config.accumulate_pct)
 
-            current_timestamp = datetime.fromtimestamp(self.market_data_provider.time()).strftime('%Y-%m-%d %H:%M:%S')
-            self.logger().info(f"Backtesting Debug: Current price={current_price:.3f}, Timestamp={current_timestamp}, Entry price={entry_price:.3f}")
-
             # Stop all unfilled executors and create new ones
             stopped_actions = self._stop_unfilled_executor()
-            self.logger().info(f"Backtesting Debug: Stopped {len(stopped_actions)} unfilled executors")
+            self.logger().info(f":: Stopped {len(stopped_actions)} unfilled executors")
             actions.extend(stopped_actions)
 
         self.direction_buy = direction_buy
 
         #========= Create new unfilled levels
         unfilled_levels_number = self.config.level_number - len(self.filled_executor_ids)
-        self.logger().info(f"Backtesting Debug: Creating {unfilled_levels_number} new executors")
+        self.logger().info(f":: Creating {unfilled_levels_number} new executors")
 
         for level_index in range(unfilled_levels_number):
             action = self._create_level_executor(level_index, entry_price, trade_side, False)
             if action:
-                self.logger().info(f"Backtesting Debug: Created executor for level {level_index} and trade side is: {trade_side}")
+                self.logger().info(f":: Created executor for level {level_index} and trade side is: {trade_side} from {entry_price:.4f} ")
                 actions.append(action)
 
         # Update last signal time when executors are created
         if actions:
             self.last_executor_creation_time = self.market_data_provider.time()
-            self.logger().info(f"Backtesting Debug: Updated last_signal_time, next signal allowed after {self.config.cooldown_time}s cooldown")
+            self.logger().info(f":: Updated last_signal_time, next signal allowed after {self.config.cooldown_time}s cooldown")
 
         # Update final level prices after creating new levels
         # self._update_final_level_prices()
 
-        self.logger().info(f"Backtesting Debug: _handle_signal returning {len(actions)} actions")
+        self.logger().info(f":: _handle_signal returning {len(actions)} actions")
         return actions
 
     def handle_stop_loss_hit(self) -> List[ExecutorAction]:
         actions = []
-        if not self.reverse_order_open:
-            actions.append(self._close_all_positions_and_stop())
-            current_price = self._get_current_price()
-            trade_side = TradeType.SELL if self.direction_buy else TradeType.BUY
-            # todo
+        actions.extend(self._close_all_positions_and_stop())
+        current_price = self._get_current_price()
+        trade_side = TradeType.SELL if self.direction_buy else TradeType.BUY
+        
+        enable_reverse_order = True
+        if enable_reverse_order:
             for level_index in range(self.config.level_number):
                 action = self._create_level_executor(level_index, current_price, trade_side, True)
                 if action:
-                    self.logger().info(f"Backtesting Debug: Created executor for level {level_index} and trade side is: {trade_side}")
+                    self.logger().info(f"Important! Reverse executor for level {level_index} and trade side is: {trade_side} at {current_price:.4f}")
                     actions.append(action)   
             self.reverse_order_open = True
         return actions    
@@ -364,12 +427,13 @@ class DynamicBBGridControllerBase(ControllerBase):
             time_limit_order_type=OrderType.MARKET  # Time limit triggers market order
         )
 
-    def _create_level_executor(self, level_index: int, entry_price: Decimal, trade_side: TradeType, is_reverse_order: bool) -> Optional[CreateExecutorAction]:
+    def _create_level_executor(self, level_index: int, entry_price: Decimal, trade_side: TradeType, is_reverse: bool = False) -> Optional[CreateExecutorAction]:
         """
         Create executor for specific level with given entry price and trade direction.
         """
         try:
             direction_multiplier = 1 if trade_side == TradeType.BUY else -1
+            reverse_direction_multiplier = 0 if is_reverse else 1
             # Calculate amount
             final_profit_level = entry_price * (
                 1 + direction_multiplier * self.config.level_number * self.config.profit_pct
@@ -384,7 +448,7 @@ class DynamicBBGridControllerBase(ControllerBase):
     
             accumulate_price = entry_price - (
                 level_index * self.config.accumulate_pct * entry_price *
-                direction_multiplier
+                direction_multiplier * reverse_direction_multiplier
             )
 
             # Calculate profit level price
@@ -417,7 +481,6 @@ class DynamicBBGridControllerBase(ControllerBase):
                 amount=amount,
                 triple_barrier_config=triple_barrier,
                 leverage=self.config.leverage,
-                is_reverse_order=is_reverse_order
             )
 
             return CreateExecutorAction(
@@ -496,8 +559,8 @@ class DynamicBBGridControllerBase(ControllerBase):
         time_limit_seconds = self.config.time_limit_hours * 3600
         executor_age = current_time - executor.timestamp
         remaining_seconds = time_limit_seconds - executor_age
-
         return max(0.0, remaining_seconds / 3600)
+
     def _check_if_hit_final_stop_loss(self) -> bool:
         """Check if we should enter stop loss waiting period based on recent executor closures"""
         current_time = self.market_data_provider.time()

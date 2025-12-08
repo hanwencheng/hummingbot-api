@@ -66,20 +66,6 @@ class BollingerDynamicBBGridV1Config(DynamicBBGridControllerConfigBase):
             "prompt_on_new": True
         }
     )
-    bb_long_threshold: float = Field(
-        default=0.2,
-        json_schema_extra={
-            "prompt": "Enter the BBP threshold for BUY signals (e.g., 0.2 for oversold): ",
-            "prompt_on_new": True
-        }
-    )
-    bb_short_threshold: float = Field(
-        default=0.8,
-        json_schema_extra={
-            "prompt": "Enter the BBP threshold for SELL signals (e.g., 0.8 for overbought): ",
-            "prompt_on_new": True
-        }
-    )
 
     @field_validator("candles_connector", mode="before")
     @classmethod
@@ -99,11 +85,6 @@ class BollingerDynamicBBGridV1Config(DynamicBBGridControllerConfigBase):
 class BollingerDynamicBBGridV1Controller(DynamicBBGridControllerBase):
     """
     Bollinger Bands Dynamic BB-Grid Strategy Controller.
-
-    Signal Logic:
-    - BUY: BBP < bb_long_threshold (price near lower band = oversold)
-    - SELL: BBP > bb_short_threshold (price near upper band = overbought)
-    - Both signals trigger level creation/updates for perpetual trading
 
     Dynamic Grid Logic:
     - Unfilled levels update to new entry prices, filled levels remain unchanged
@@ -137,7 +118,7 @@ class BollingerDynamicBBGridV1Controller(DynamicBBGridControllerBase):
                 connector_name=self.config.candles_connector,
                 trading_pair=self.config.candles_trading_pair,
                 interval=self.config.interval,
-                max_records=self.max_records
+                max_records=self.max_records + 10
             )
 
             # Debug logging for data availability
@@ -169,34 +150,37 @@ class BollingerDynamicBBGridV1Controller(DynamicBBGridControllerBase):
             bbu_col = f"BBU_{bb_suffix}"
             bbl_col = f"BBL_{bb_suffix}"
             print(f"📊 DEBUG: Looking for BBP column: {bbp_col}")
+            print(f"📊 DEBUG: Looking for BBU column: {bbu_col}")
+            print(f"📊 DEBUG: Looking for BBL column: {bbl_col}")
             print(f"📊 DEBUG: Available columns after bbands: {list(df.columns)}")
-            rsi = df["RSI_14"]
-            close_price = df["close"]
-            df["bbp"] = (df["close"] - df[bbl_col]) / (df[bbu_col] - df[bbl_col])
-            bbp = df["bbp"]
-            print(f"📊 DEBUG: BBP column is: {bbp}")
+            df["bbp"] = bbp = (df["close"] - df[bbl_col]) / (df[bbu_col] - df[bbl_col])
+            df["bbu"] = df[bbu_col]
+            df["bbl"] = df[bbl_col]
+            df["rsi"] = rsi = df["RSI_14"]
+            # Calculate Wilder's EMA components for real-time RSI calculation
+            # Calculate price changes and store previous price
+            df['prev_price'] = df['close'].shift(1)
+            df['price_change'] = df['close'].diff()
+            df['gain'] = df['price_change'].where(df['price_change'] > 0, 0)
+            df['loss'] = -df['price_change'].where(df['price_change'] < 0, 0)
 
-            # Generate signal based on BBP thresholds
-            # BUY signals (oversold condition) and SELL signals (overbought condition)
-            long_condition = (
-                ((bbp < self.config.bb_long_threshold) & (rsi < 32)) |
-                ((bbp > self.config.bb_short_threshold) & (rsi < 60))
-            )
-
-            short_condition = (
-                ((bbp > self.config.bb_short_threshold) & (rsi > 68)) |
-                ((bbp < self.config.bb_long_threshold) & (rsi > 40))
-            )  
-            df["signal"] = 0
-            df.loc[long_condition, "signal"] = -1
-            df.loc[short_condition, "signal"] = 1
-            
+            # Initialize avg_gain and avg_loss using Wilder's EMA method
+            alpha = 1.0 / 14  # Wilder's smoothing factor for 14-period RSI
+            df['avg_gain'] = df['gain'].ewm(alpha=alpha, adjust=False).mean()
+            df['avg_loss'] = df['loss'].ewm(alpha=alpha, adjust=False).mean()
+        
 
             # Store processed data
             self.processed_data = {
-                "signal": df["signal"].iloc[-1],
                 "features": df,
-                "bbp": df["bbp"].iloc[-1],
+                "bbp": df[bbp_col].iloc[-1],
+                "bbu": df[bbu_col].iloc[-1],
+                "bbl": df[bbl_col].iloc[-1],
+                "rsi": df["RSI_14"].iloc[-1],
+                "close": df["close"].iloc[-1],
+                "prev_price": df["prev_price"].iloc[-1],
+                "avg_gain": df["avg_gain"].iloc[-1],
+                "avg_loss": df["avg_loss"].iloc[-1]
             }
 
         except Exception as e:
@@ -215,8 +199,6 @@ class BollingerDynamicBBGridV1Controller(DynamicBBGridControllerBase):
             status.append("")
             status.append("Bollinger Bands Info:")
             status.append(f"  BBP: {self.processed_data['bbp']:.3f}")
-            status.append(f"  BUY Threshold: < {self.config.bb_long_threshold}")
-            status.append(f"  SELL Threshold: > {self.config.bb_short_threshold}")
             status.append(f"  BB Length: {self.config.bb_length}")
             status.append(f"  BB Std Dev: {self.config.bb_std}")
 
