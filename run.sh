@@ -14,7 +14,7 @@ if [[ "$1" == "--dev" ]]; then
 
     # Set environment variables for verbose logging
     export PYTHONPATH="${PWD}:${PYTHONPATH}"
-    export HUMMINGBOT_LOGGING_LEVEL="DEBUG"
+    export HUMMINGBOT_LOGGING_LEVEL="INFO"
 
     echo "🔍 Enhanced logging enabled for:"
     echo "   - Backtesting engine (DEBUG level)"

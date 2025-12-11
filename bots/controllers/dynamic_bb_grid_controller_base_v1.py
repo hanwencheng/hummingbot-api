@@ -20,6 +20,7 @@ Key Logic:
 
 from decimal import Decimal
 from typing import Dict, List, Optional
+from numpy import sign
 from pydantic import Field, field_validator
 from datetime import datetime
 
@@ -34,7 +35,6 @@ from hummingbot.strategy_v2.executors.position_executor.data_types import Positi
 from hummingbot.strategy_v2.models.executor_actions import CreateExecutorAction, ExecutorAction, StopExecutorAction
 from hummingbot.strategy_v2.models.executors import CloseType
 from hummingbot.core.data_type.common import MarketDict
-from sqlalchemy.sql.operators import OperatorType
 
 
 class DynamicBBGridControllerConfigBase(ControllerConfigBase):
@@ -135,11 +135,18 @@ class DynamicBBGridControllerConfigBase(ControllerConfigBase):
     )
 
     # Skew parameters for level price adjustments
+    reverse_skew: Decimal = Field(
+        default=Decimal("0.2"),
+        json_schema_extra={
+            "prompt_on_new": True,
+            "prompt": "The skew multiplier for reverse order(e.g., 1.0 for equal spacing):",
+        }
+    )
     profit_skew: Decimal = Field(
         default=Decimal("1.0"),
         json_schema_extra={
             "prompt_on_new": True,
-            "prompt": "Enter the profit skew multiplier (e.g., 1.0 for equal spacing):",
+            "prompt": "Enter the take profit skew multiplier (e.g., 0.0 for equal pricing):",
         }
     )
     stop_loss_skew: Decimal = Field(
@@ -149,23 +156,23 @@ class DynamicBBGridControllerConfigBase(ControllerConfigBase):
             "prompt": "Enter the stop loss skew multiplier (e.g., 0.0 for equal pricing):",
         }
     )
-    bb_long_threshold: float = Field(
-        default=0.1,
+    bb_weak_threshold: float = Field(
+        default=0.04,
         json_schema_extra={
-            "prompt": "Enter the BBP threshold for BUY signals (e.g., 0.2 for oversold): ",
+            "prompt": "The Bollinger Band width threshold for weak trend, a percentage calculated by (BBU-BBL)/BBU",
             "prompt_on_new": True
         }
     )
-    bb_short_threshold: float = Field(
-        default=0.9,
+    bb_strong_threshold: float = Field(
+        default=0.08,
         json_schema_extra={
-            "prompt": "Enter the BBP threshold for SELL signals (e.g., 0.8 for overbought): ",
+            "prompt": "The Bollinger Band width threshold for strong trend, a percentage calculated by (BBU-BBL)/BBU",
             "prompt_on_new": True
         }
     )
 
 
-    @field_validator('accumulate_pct', 'profit_pct', 'stop_loss_pct', 'profit_skew', 'stop_loss_skew')
+    @field_validator('accumulate_pct', 'profit_pct', 'stop_loss_pct', 'profit_skew', 'stop_loss_skew', 'reverse_skew', 'bb_weak_threshold', 'bb_strong_threshold')
     def validate_percentages(cls, v):
         if v < 0 or v > 1:
             raise ValueError("Percentage values must be between 0 and 1")
@@ -225,7 +232,7 @@ class DynamicBBGridControllerBase(ControllerBase):
         # Check and close expired executors
         expired_actions = self._check_and_close_expired_executors()
         if expired_actions:
-            self.logger().info(f":: Found {len(expired_actions)} expired executors, returning early")
+            self.logger().debug(f":: Found {len(expired_actions)} expired executors, returning early")
             return expired_actions
 
         has_stop_loss_hit = self._check_if_hit_final_stop_loss()
@@ -233,12 +240,11 @@ class DynamicBBGridControllerBase(ControllerBase):
             actions.extend(self.handle_stop_loss_hit())
             return actions
         elif not has_stop_loss_hit and self.reverse_order_open:
-            self.logger().info(f"stop loss period ended, close reverse order")
+            self.logger().debug(f"stop loss period ended, close reverse order")
             actions.extend(self._close_all_positions_and_stop())
             self.reverse_order_open = False
             return actions
         elif has_stop_loss_hit and self.reverse_order_open:
-            self.logger().info(f"reverse order opening now")
             return actions
             
 
@@ -266,11 +272,14 @@ class DynamicBBGridControllerBase(ControllerBase):
             return True
         else:
             remaining_cooldown = self.config.cooldown_time - time_since_last_signal
-            self.logger().info(f":: No Signal Check, still in cooldown period. {remaining_cooldown:.1f}s remaining")
+            self.logger().debug(f":: No Signal Check, still in cooldown period. {remaining_cooldown:.1f}s remaining")
             return False
 
     def _calculate_signal(self, processed_data: any):
         signal = 0
+        
+        if "bbu" not in processed_data:
+            return signal
 
         bbu = processed_data['bbu']
         bbl = processed_data['bbl']
@@ -280,8 +289,30 @@ class DynamicBBGridControllerBase(ControllerBase):
         avg_gain = processed_data["avg_gain"]
         prev_price = processed_data["prev_price"]
         avg_loss = processed_data["avg_loss"]
-        readable_time = datetime.fromtimestamp(processed_data["timestamp"]).strftime('%Y-%m-%d %H:%M:%S')
-        bbp = (close_bt - bbl)/(bbu - bbl)
+        current_price = self._get_current_price()
+        readable_time = datetime.fromtimestamp(self.market_data_provider.time()).strftime('%Y-%m-%d %H:%M:%S')
+        # readable_time = datetime.fromtimestamp(processed_data["timestamp"]).strftime('%Y-%m-%d %H:%M:%S')
+        bbp = (float(current_price) - bbl)/(bbu - bbl)
+        bb_relative_width = (bbu - bbl) / bbu
+        bb_width_offset = -0.1
+        bb_width_threshold = 0.04
+        bb_width_multiplier_base = max(0.2, bb_relative_width / bb_width_threshold + bb_width_offset)
+        bb_width_multiplier_max = 1.5
+        bb_width_multiplier = min(bb_width_multiplier_base, bb_width_multiplier_max)
+
+        bb_long_threshold = 0.1
+        bb_short_threshold = 0.9
+
+        if bb_relative_width < self.config.bb_weak_threshold:
+            bb_long_threshold = 0.01
+            bb_short_threshold = 0.99
+        
+        elif bb_relative_width < self.config.bb_strong_threshold:
+            bb_long_threshold = 0.06
+            bb_short_threshold = 0.94
+        else:
+            bb_long_threshold = 0.12
+            bb_short_threshold = 0.88
 
         # Calculate real-time RSI using current price and stored averages
         realtime_rsi = self._calculate_realtime_rsi(
@@ -290,12 +321,13 @@ class DynamicBBGridControllerBase(ControllerBase):
 
         # not accurate if it is lower than 4% of the bbu
 
-        if bbp > self.config.bb_short_threshold:
-            signal = -1 
-        if bbp < self.config.bb_long_threshold:
-            signal = 1
+        if passed_bbp > bb_short_threshold:
+            signal = -1 * bb_width_multiplier
+        if passed_bbp < bb_long_threshold:
+            signal = 1 * bb_width_multiplier
             
-        if not signal == 0:
+        current_seconds = datetime.fromtimestamp(self.market_data_provider.time()).second
+        if current_seconds == 0 or signal != 0:
             self.logger().info(f"close_bt is {close_bt:.4f}, bbp is {bbp:.4f}, and bbu is {bbu:.4f}, and bbl is {bbl:.4f}")
             self.logger().info(f"Time: {readable_time} | Signal: {signal} | BBP: {bbp:.4f} | price: {close_bt:.4f} | rsi: {realtime_rsi:.2f}")
         return signal
@@ -337,12 +369,12 @@ class DynamicBBGridControllerBase(ControllerBase):
 
         #========= close unfilled levels
         if self._get_total_position() != Decimal("0") and self.direction_buy != direction_buy:
-            self.logger().info(f"Important! Closing all positions and stopping due to direction change")
+            self.logger().debug(f"Important! Closing all positions and stopping due to direction change")
             actions.extend(self._close_all_positions_and_stop())
         else:
             # Check if all levels are filled
             if len(self.filled_executor_ids) >= self.config.level_number:
-                self.logger().info(f":: All levels filled ({len(self.filled_executor_ids)} >= {self.config.level_number}), waiting for profit/stop loss")
+                self.logger().debug(f":: All levels filled ({len(self.filled_executor_ids)} >= {self.config.level_number}), waiting for profit/stop loss")
                 return actions  # All levels filled, wait for profit/stop loss
 
             current_price = self._get_current_price()
@@ -353,30 +385,26 @@ class DynamicBBGridControllerBase(ControllerBase):
 
             # Stop all unfilled executors and create new ones
             stopped_actions = self._stop_unfilled_executor()
-            self.logger().info(f":: Stopped {len(stopped_actions)} unfilled executors")
+            self.logger().debug(f":: Stopped {len(stopped_actions)} unfilled executors")
             actions.extend(stopped_actions)
 
         self.direction_buy = direction_buy
 
         #========= Create new unfilled levels
         unfilled_levels_number = self.config.level_number - len(self.filled_executor_ids)
-        self.logger().info(f":: Creating {unfilled_levels_number} new executors")
+        self.logger().debug(f":: Creating {unfilled_levels_number} new executors")
 
         for level_index in range(unfilled_levels_number):
-            action = self._create_level_executor(level_index, entry_price, trade_side, False)
+            action = self._create_level_executor(level_index, entry_price, trade_side, abs(signal), False)
             if action:
-                self.logger().info(f":: Created executor for level {level_index} and trade side is: {trade_side} from {entry_price:.4f} ")
+                self.logger().debug(f":: Created executor for level {level_index} and trade side is: {trade_side} from {entry_price:.4f} ")
                 actions.append(action)
 
         # Update last signal time when executors are created
         if actions:
             self.last_executor_creation_time = self.market_data_provider.time()
-            self.logger().info(f":: Updated last_signal_time, next signal allowed after {self.config.cooldown_time}s cooldown")
+            self.logger().debug(f":: Updated last_signal_time, next signal allowed after {self.config.cooldown_time}s cooldown")
 
-        # Update final level prices after creating new levels
-        # self._update_final_level_prices()
-
-        self.logger().info(f":: _handle_signal returning {len(actions)} actions")
         return actions
 
     def handle_stop_loss_hit(self) -> List[ExecutorAction]:
@@ -388,9 +416,9 @@ class DynamicBBGridControllerBase(ControllerBase):
         enable_reverse_order = True
         if enable_reverse_order:
             for level_index in range(self.config.level_number):
-                action = self._create_level_executor(level_index, current_price, trade_side, True)
+                action = self._create_level_executor(level_index, current_price, trade_side, 1, True)
                 if action:
-                    self.logger().info(f"Important! Reverse executor for level {level_index} and trade side is: {trade_side} at {current_price:.4f}")
+                    self.logger().debug(f"Important! Reverse executor for level {level_index} and trade side is: {trade_side} at {current_price:.4f}")
                     actions.append(action)   
             self.reverse_order_open = True
         return actions    
@@ -427,13 +455,13 @@ class DynamicBBGridControllerBase(ControllerBase):
             time_limit_order_type=OrderType.MARKET  # Time limit triggers market order
         )
 
-    def _create_level_executor(self, level_index: int, entry_price: Decimal, trade_side: TradeType, is_reverse: bool = False) -> Optional[CreateExecutorAction]:
+    def _create_level_executor(self, level_index: int, entry_price: Decimal, trade_side: TradeType, level_size_multiplier: float, is_reverse: bool = False) -> Optional[CreateExecutorAction]:
         """
         Create executor for specific level with given entry price and trade direction.
         """
         try:
             direction_multiplier = 1 if trade_side == TradeType.BUY else -1
-            reverse_direction_multiplier = 0 if is_reverse else 1
+            reverse_direction_multiplier = self.config.reverse_skew if is_reverse else 1
             # Calculate amount
             final_profit_level = entry_price * (
                 1 + direction_multiplier * self.config.level_number * self.config.profit_pct
@@ -471,6 +499,8 @@ class DynamicBBGridControllerBase(ControllerBase):
 
             amount = self.config.level_size / accumulate_price
 
+            self.logger().debug(f"level size is: {self.config.level_size}, and accumulate_price is {accumulate_price}, and level_size_multiplier is {Decimal(level_size_multiplier)} and leverage is {self.config.leverage}, and amount is {amount * Decimal(level_size_multiplier)}, and profit price is {profit_price}, stop loss is{stop_loss_price}")
+
             # Create executor config
             executor_config = PositionExecutorConfig(
                 timestamp=self.market_data_provider.time(),
@@ -478,7 +508,7 @@ class DynamicBBGridControllerBase(ControllerBase):
                 trading_pair=self.config.trading_pair,
                 side=trade_side,
                 entry_price=accumulate_price,
-                amount=amount,
+                amount=amount * Decimal(level_size_multiplier),
                 triple_barrier_config=triple_barrier,
                 leverage=self.config.leverage,
             )
@@ -545,7 +575,7 @@ class DynamicBBGridControllerBase(ControllerBase):
 
         # TODO to be deleted after test
         if expired_executor_ids:
-            self.logger().info(f"Closing expired executors: {expired_executor_ids}")
+            self.logger().debug(f"Closing expired executors: {expired_executor_ids}")
 
         return actions
 
@@ -572,7 +602,7 @@ class DynamicBBGridControllerBase(ControllerBase):
                 executor_close_time = getattr(executor, 'close_timestamp', 0)
 
                 if executor_close_time > self.most_recent_stop_loss_time:
-                    self.logger().info(f"new top loss find, Stop loss waiting period active.")
+                    self.logger().debug(f"new top loss find, Stop loss waiting period active.")
                     self.most_recent_stop_loss_time = executor_close_time
 
         # Check if enough time has passed since the most recent stop loss

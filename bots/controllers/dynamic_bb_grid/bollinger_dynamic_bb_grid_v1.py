@@ -18,7 +18,7 @@ from pydantic_core.core_schema import ValidationInfo
 from hummingbot.core.data_type.common import PriceType
 from hummingbot.data_feed.candles_feed.data_types import CandlesConfig
 from hummingbot.strategy_v2.models.executors import CloseType
-from bots.controllers.dynamic_bb_grid_controller_base import (
+from ..dynamic_bb_grid_controller_base_v1 import (
     DynamicBBGridControllerBase,
     DynamicBBGridControllerConfigBase
 )
@@ -118,12 +118,8 @@ class BollingerDynamicBBGridV1Controller(DynamicBBGridControllerBase):
                 connector_name=self.config.candles_connector,
                 trading_pair=self.config.candles_trading_pair,
                 interval=self.config.interval,
-                max_records=self.max_records + 10
+                max_records=self.max_records + 1100
             )
-
-            # Debug logging for data availability
-            self.logger().info(f"Backtesting Debug: Got candles data - rows: {len(df) if df is not None else 0}, required: {self.config.bb_length} with interval {self.config.interval}")
-            self.logger().info(f"Backtesting Debug: Got candles data - rows: {len(df) if df is not None else 0}, required: {self.config.bb_length} with interval {self.config.interval}")
 
             if df is None or len(df) < self.config.bb_length:
                 # Not enough data for BB calculation
@@ -142,17 +138,11 @@ class BollingerDynamicBBGridV1Controller(DynamicBBGridControllerBase):
                 append=True
             )
             df.ta.rsi(length=14, append=True)
-            # Use close price from candle data instead of live market data (for backtesting compatibility)
-            current_price = self.market_data_provider.get_price_by_type(self.config.connector_name,self.config.trading_pair,PriceType.MidPrice)
-            self.logger().info(f'get current price: {current_price}')
+            # current_price = self.market_data_provider.get_price_by_type(self.config.connector_name,self.config.trading_pair,PriceType.MidPrice)
             bb_suffix = f"{self.config.bb_length}_{self.config.bb_std}_{self.config.bb_std}"
             bbp_col = f"BBP_{bb_suffix}"
             bbu_col = f"BBU_{bb_suffix}"
             bbl_col = f"BBL_{bb_suffix}"
-            print(f"📊 DEBUG: Looking for BBP column: {bbp_col}")
-            print(f"📊 DEBUG: Looking for BBU column: {bbu_col}")
-            print(f"📊 DEBUG: Looking for BBL column: {bbl_col}")
-            print(f"📊 DEBUG: Available columns after bbands: {list(df.columns)}")
             df["bbp"] = bbp = (df["close"] - df[bbl_col]) / (df[bbu_col] - df[bbl_col])
             df["bbu"] = df[bbu_col]
             df["bbl"] = df[bbl_col]

@@ -40,8 +40,6 @@ class FundingRecorder:
         for event, forwarder in self._event_pairs:
             connector.add_listener(event, forwarder)
             
-        self.logger.info(f"FundingRecorder started for {self.account_name}/{self.connector_name}")
-    
     async def stop(self):
         """Stop recording funding payments"""
         if self._connector:

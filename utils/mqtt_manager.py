@@ -212,8 +212,6 @@ class MQTTManager:
         # Check for duplicates
         current_time = time.time()
         if message_hash in self._processed_messages:
-            # Skip duplicate message
-            logger.debug(f"Skipping duplicate log message from {bot_id}: {message[:50]}...")
             return
 
         # Clean up old message hashes (older than TTL)

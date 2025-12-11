@@ -66,18 +66,11 @@ class ConnectorManager:
         conn_setting = AllConnectorSettings.get_connector_settings()[connector_name]
         keys = BackendAPISecurity.api_keys(connector_name)
 
-        # Debug logging
-        logger.info(f"Creating connector {connector_name} for account {account_name}")
-        logger.debug(f"API keys retrieved: {list(keys.keys()) if keys else 'None'}")
-
         init_params = conn_setting.conn_init_parameters(
             trading_pairs=[],
             trading_required=True,
             api_keys=keys,
         )
-
-        # Debug logging
-        logger.debug(f"Init params keys: {list(init_params.keys())}")
 
         connector_class = get_connector_class(connector_name)
         connector = connector_class(**init_params)
@@ -242,7 +235,6 @@ class ConnectorManager:
         # Perform initial update of connector state
         await self._update_connector_state(connector, connector_name)
 
-        logger.info(f"Initialized connector {connector_name} for account {account_name}")
         return connector
 
     async def _start_connector_network(self, connector: ConnectorBase):
@@ -368,8 +360,6 @@ class ConnectorManager:
                 # Get active orders from database for this account/connector
                 active_orders = await order_repo.get_active_orders(account_name=account_name, connector_name=connector_name)
 
-                logger.info(f"Loading {len(active_orders)} existing active orders for {account_name}/{connector_name}")
-
                 for order_record in active_orders:
                     try:
                         # Convert database order to InFlightOrder
@@ -383,10 +373,6 @@ class ConnectorManager:
                     except Exception as e:
                         logger.error(f"Error converting database order {order_record.client_order_id} to InFlightOrder: {e}")
                         continue
-
-                logger.info(
-                    f"Successfully loaded {len(connector.in_flight_orders)} in-flight orders for {account_name}/{connector_name}"
-                )
 
         except Exception as e:
             logger.error(f"Error loading existing orders from database for {account_name}/{connector_name}: {e}")
@@ -466,7 +452,6 @@ class ConnectorManager:
             try:
                 await self._orders_recorders[cache_key].stop()
                 del self._orders_recorders[cache_key]
-                logger.info(f"Stopped order recorder for {account_name}/{connector_name}")
             except Exception as e:
                 logger.error(f"Error stopping order recorder for {account_name}/{connector_name}: {e}")
 
@@ -475,7 +460,6 @@ class ConnectorManager:
             try:
                 await self._funding_recorders[cache_key].stop()
                 del self._funding_recorders[cache_key]
-                logger.info(f"Stopped funding recorder for {account_name}/{connector_name}")
             except Exception as e:
                 logger.error(f"Error stopping funding recorder for {account_name}/{connector_name}: {e}")
 

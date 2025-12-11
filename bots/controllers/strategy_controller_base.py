@@ -66,7 +66,7 @@ class StrategyControllerConfigBase(ControllerConfigBase):
             "prompt": "Enter the percentage difference between levels (e.g., 0.01 for 1%):",
         }
     )
-    profit_level_pct: Decimal = Field(
+    profit_pct: Decimal = Field(
         default=Decimal("0.02"),
         json_schema_extra={
             "prompt_on_new": True,
@@ -94,7 +94,7 @@ class StrategyControllerConfigBase(ControllerConfigBase):
             "prompt": "Enter the quote asset amount for each level:",
         }
     )
-    time_limit: int = Field(
+    time_limit_hours: int = Field(
         default=168,
         json_schema_extra={
             "prompt_on_new": True,
@@ -117,7 +117,7 @@ class StrategyControllerConfigBase(ControllerConfigBase):
     profit_skew: Decimal = Field(default=Decimal("1"))
     stop_loss_skew: Decimal = Field(default=Decimal("0"))
 
-    @field_validator('level_pct', 'profit_level_pct', 'stop_loss_pct', 'accumulate_pct', 'accumulate_skew', 'profit_skew', 'stop_loss_skew')
+    @field_validator('level_pct', 'profit_pct', 'stop_loss_pct', 'accumulate_pct', 'accumulate_skew', 'profit_skew', 'stop_loss_skew')
     def validate_percentages(cls, v):
         if v < 0 or v > 1:
             raise ValueError("Percentage values must be between 0 and 1")
@@ -161,12 +161,6 @@ class StrategyControllerBase(ControllerBase):
         old_config = self.config
         self.config = new_config
 
-        # Log the config update for debugging
-        self.logger().info(f"Updating config for controller {self.config.id}")
-        self.logger().info(f"Old entry_price: {old_config.entry_price}, New entry_price: {new_config.entry_price}")
-        self.logger().info(f"Old level_size: {old_config.level_size}, New level_size: {new_config.level_size}")
-        self.logger().info(f"Old leverage: {old_config.leverage}, New leverage: {new_config.leverage}")
-
         # Clear cached data that depends on configuration
         self.processed_data.clear()
         self.level_states.clear()
@@ -209,7 +203,7 @@ class StrategyControllerBase(ControllerBase):
         direction_multiplier = 1 if self.config.direction_buy else -1
 
         self.config.final_profit_level = self.config.entry_price * (
-            1 + direction_multiplier * self.config.level_number * self.config.profit_level_pct
+            1 + direction_multiplier * self.config.level_number * self.config.profit_pct
         )
 
         self.config.final_accumulate_price = self.config.entry_price * (
@@ -235,7 +229,7 @@ class StrategyControllerBase(ControllerBase):
 
         # Calculate profit level price
         profit_price = self.config.final_profit_level - (
-            level_index * self.config.profit_level_pct * self.config.entry_price *
+            level_index * self.config.profit_pct * self.config.entry_price *
             direction_multiplier * self.config.profit_skew
         )
 
@@ -276,7 +270,7 @@ class StrategyControllerBase(ControllerBase):
         return TripleBarrierConfig(
             take_profit=take_profit_pct,
             stop_loss=stop_loss_pct,
-            time_limit=self.config.time_limit * 3600,  # Convert hours to seconds
+            time_limit=self.config.time_limit_hours * 3600,  # Convert hours to seconds
             open_order_type=OrderType.LIMIT,  # Entry order is limit order
             take_profit_order_type=OrderType.LIMIT,  # Profit at specific price level
             stop_loss_order_type=OrderType.MARKET,  # Stop loss triggers market order
@@ -440,7 +434,7 @@ class StrategyControllerBase(ControllerBase):
         if self.strategy_start_time is None:
             return False
         time_elapsed_hours = (self.market_data_provider.time() - self.strategy_start_time) / 3600
-        return time_elapsed_hours > self.config.time_limit
+        return time_elapsed_hours > self.config.time_limit_hours
 
     def _check_final_levels_hit(self, current_price: Decimal) -> bool:
         """Check if final profit or stop loss levels have been hit"""
@@ -491,7 +485,7 @@ class StrategyControllerBase(ControllerBase):
             status.append("Status: STOPPED (Final levels hit)")
         elif hasattr(self, 'strategy_start_time') and self.strategy_start_time:
             elapsed = (self.market_data_provider.time() - self.strategy_start_time) / 3600
-            status.append(f"Running Time: {elapsed:.1f}h / {self.config.time_limit}h")
+            status.append(f"Running Time: {elapsed:.1f}h / {self.config.time_limit_hours}h")
             status.append("Status: ACTIVE")
         else:
             status.append("Status: Initializing...")
