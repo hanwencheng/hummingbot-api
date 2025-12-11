@@ -327,7 +327,7 @@ class DynamicBBGridControllerBase(ControllerBase):
             signal = 1 * bb_width_multiplier
             
         current_seconds = datetime.fromtimestamp(self.market_data_provider.time()).second
-        if current_seconds == 0 or signal != 0:
+        if current_seconds == 0 and signal != 0:
             self.logger().info(f"close_bt is {close_bt:.4f}, bbp is {bbp:.4f}, and bbu is {bbu:.4f}, and bbl is {bbl:.4f}")
             self.logger().info(f"Time: {readable_time} | Signal: {signal} | BBP: {bbp:.4f} | price: {close_bt:.4f} | rsi: {realtime_rsi:.2f}")
         return signal
