@@ -22,11 +22,11 @@ from ..dynamic_bb_grid_controller_base import (
 )
 
 
-class BollingerDynamicBBGridV1Config(DynamicBBGridControllerConfig):
-    controller_name: str = "bollinger_dynamic_bb_grid_v1"
+class BollingerDynamicBBGridV3Config(DynamicBBGridControllerConfig):
+    controller_name: str = "bollinger_dynamic_bb_grid_v3"
 
 
-class BollingerDynamicBBGridV1Controller(DynamicBBGridController):
+class BollingerDynamicBBGridV3Controller(DynamicBBGridController):
     """
     Bollinger Bands Dynamic BB-Grid Strategy Controller.
 
@@ -35,7 +35,7 @@ class BollingerDynamicBBGridV1Controller(DynamicBBGridController):
     - All levels filled = wait for profit/stop loss targets
     """
 
-    def __init__(self, config: BollingerDynamicBBGridV1Config, *args, **kwargs):
+    def __init__(self, config: BollingerDynamicBBGridV3Config, *args, **kwargs):
         super().__init__(config, *args, **kwargs)
         self.config.controller_name = config.controller_name
         self.max_records = self.config.bb_length + 20 # Extra buffer for BB calculation
@@ -49,7 +49,6 @@ class BollingerDynamicBBGridV1Controller(DynamicBBGridController):
                     max_records=self.max_records 
                 )
             ]
-
     def determine_executor_actions(self) -> List[ExecutorAction]:
         """
         Main strategy logic with dynamic level management.
@@ -75,17 +74,25 @@ class BollingerDynamicBBGridV1Controller(DynamicBBGridController):
             self.reverse_order_open = False
             return actions
         elif has_stop_loss_hit and self.reverse_order_open:
+            actions = self._check_reverse_open_order_time()
             return actions
-            
 
-        #========= Check cooldown time before creating new executors
         if not self._check_cooldown_time():
             return actions
-        
+            
         signal = self._calculate_signal(self.processed_data)
         signal_actions = self._handle_signal(signal)
         actions.extend(signal_actions)
 
+        return actions
+
+    def _check_reverse_open_order_time(self) -> List[ExecutorAction]:
+        actions = []
+        current_time = self.market_data_provider.time()
+        reverse_order_creation_time = current_time - self.most_recent_stop_loss_time
+        if reverse_order_creation_time > self.config.cooldown_time:
+            actions = self._stop_unfilled_executor()
+        
         return actions
 
     def _check_cooldown_time(self) -> bool:
@@ -157,9 +164,9 @@ class BollingerDynamicBBGridV1Controller(DynamicBBGridController):
             signal = 1 * bb_width_multiplier
             
         current_seconds = datetime.fromtimestamp(self.market_data_provider.time()).second
-        if current_seconds == 0 and signal != 0:
-            self.logger().debug(f"close_bt is {close_bt:.4f}, bbp is {bbp:.4f}, and bbu is {bbu:.4f}, and bbl is {bbl:.4f}")
-            self.logger().debug(f"Time: {readable_time} | Signal: {signal} | BBP: {bbp:.4f} | price: {close_bt:.4f} | rsi: {realtime_rsi:.2f}")
+        if current_seconds == 0:
+            self.logger().info(f"close_bt is {close_bt:.4f}, bbp is {bbp:.4f}, and bbu is {bbu:.4f}, and bbl is {bbl:.4f}")
+            self.logger().info(f"Time: {readable_time} | Signal: {signal} | BBP: {bbp:.4f} | price: {close_bt:.4f} | rsi: {realtime_rsi:.2f}")
         return signal
 
     def _handle_signal(self, signal: int) -> List[ExecutorAction]:

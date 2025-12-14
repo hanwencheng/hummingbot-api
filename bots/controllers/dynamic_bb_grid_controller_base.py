@@ -22,7 +22,7 @@ from decimal import Decimal
 from typing import List, Optional
 from pydantic import Field, field_validator
 from datetime import datetime
-import pytz
+from pydantic_core.core_schema import ValidationInfo
 
 import pandas as pd
 import pandas_ta as ta 
@@ -31,20 +31,54 @@ from hummingbot.core.data_type.common import OrderType, PositionMode, TradeType,
 from hummingbot.data_feed.candles_feed.data_types import CandlesConfig
 from hummingbot.strategy_v2.controllers.controller_base import ControllerBase, ControllerConfigBase
 from hummingbot.strategy_v2.executors.data_types import ConnectorPair
-from hummingbot.strategy_v2.executors.position_executor.data_types import PositionExecutorConfig, TripleBarrierConfig
+from hummingbot.strategy_v2.executors.position_executor.data_types import PositionExecutorConfig, TrailingStop, TripleBarrierConfig
 from hummingbot.strategy_v2.models.executor_actions import CreateExecutorAction, ExecutorAction, StopExecutorAction
 from hummingbot.strategy_v2.models.executors import CloseType
 from hummingbot.core.data_type.common import MarketDict
-from sqlalchemy.sql.operators import OperatorType
+from .bb_stage import BBStage
 
-
-class DynamicBBGridControllerConfigBase(ControllerConfigBase):
+class DynamicBBGridControllerConfig(ControllerConfigBase):
     """
     Configuration for Dynamic BB-Grid strategy controllers.
     """
     controller_type: str = "dynamic_bb_grid"
     candles_config: List[CandlesConfig] = []
-
+    candles_connector: str = Field(
+        default=None,
+        json_schema_extra={
+            "prompt": "Enter the connector for the candles data, leave empty to use the same exchange as the connector: ",
+            "prompt_on_new": True
+        }
+    )
+    candles_trading_pair: str = Field(
+        default=None,
+        json_schema_extra={
+            "prompt": "Enter the trading pair for the candles data, leave empty to use the same trading pair as the connector: ",
+            "prompt_on_new": True
+        }
+    )
+    interval: str = Field(
+        default="15m",
+        json_schema_extra={
+            "prompt": "Enter the candle interval (e.g., 1m, 5m, 1h, 1d): ",
+            "prompt_on_new": True
+        }
+    )
+    # Bollinger Bands parameters
+    bb_length: int = Field(
+        default=20,
+        json_schema_extra={
+            "prompt": "Enter the Bollinger Bands length: ",
+            "prompt_on_new": True
+        }
+    )
+    bb_std: float = Field(
+        default=2.0,
+        json_schema_extra={
+            "prompt": "Enter the Bollinger Bands standard deviation: ",
+            "prompt_on_new": True
+        }
+    )
     # Trading pair configuration
     connector_name: str = Field(
         default="hyperliquid_perpetual",
@@ -105,7 +139,7 @@ class DynamicBBGridControllerConfigBase(ControllerConfigBase):
     )
 
     # Time limits
-    time_limit_hours: int = Field(
+    time_limit_hours: float = Field(
         default=1,
         json_schema_extra={
             "prompt_on_new": True,
@@ -114,7 +148,7 @@ class DynamicBBGridControllerConfigBase(ControllerConfigBase):
     )
 
     # Stop loss waiting time
-    stop_loss_waiting_time_hours: int = Field(
+    stop_loss_waiting_time_hours: float = Field(
         default=4,
         json_schema_extra={
             "prompt_on_new": True,
@@ -136,11 +170,18 @@ class DynamicBBGridControllerConfigBase(ControllerConfigBase):
     )
 
     # Skew parameters for level price adjustments
+    reverse_skew: Decimal = Field(
+        default=Decimal("0.2"),
+        json_schema_extra={
+            "prompt_on_new": True,
+            "prompt": "The skew multiplier for reverse order(e.g., 1.0 for equal spacing):",
+        }
+    )
     profit_skew: Decimal = Field(
         default=Decimal("1.0"),
         json_schema_extra={
             "prompt_on_new": True,
-            "prompt": "Enter the profit skew multiplier (e.g., 1.0 for equal spacing):",
+            "prompt": "Enter the take profit skew multiplier (e.g., 0.0 for equal pricing):",
         }
     )
     stop_loss_skew: Decimal = Field(
@@ -150,23 +191,23 @@ class DynamicBBGridControllerConfigBase(ControllerConfigBase):
             "prompt": "Enter the stop loss skew multiplier (e.g., 0.0 for equal pricing):",
         }
     )
-    bb_long_threshold: float = Field(
-        default=0.1,
+    bb_weak_threshold: float = Field(
+        default=0.04,
         json_schema_extra={
-            "prompt": "Enter the BBP threshold for BUY signals (e.g., 0.2 for oversold): ",
+            "prompt": "The Bollinger Band width threshold for weak trend, a percentage calculated by (BBU-BBL)/BBU",
             "prompt_on_new": True
         }
     )
-    bb_short_threshold: float = Field(
-        default=0.9,
+    bb_strong_threshold: float = Field(
+        default=0.08,
         json_schema_extra={
-            "prompt": "Enter the BBP threshold for SELL signals (e.g., 0.8 for overbought): ",
+            "prompt": "The Bollinger Band width threshold for strong trend, a percentage calculated by (BBU-BBL)/BBU",
             "prompt_on_new": True
         }
     )
 
 
-    @field_validator('accumulate_pct', 'profit_pct', 'stop_loss_pct', 'profit_skew', 'stop_loss_skew')
+    @field_validator('accumulate_pct', 'profit_pct', 'stop_loss_pct', 'profit_skew', 'stop_loss_skew', 'reverse_skew', 'bb_weak_threshold', 'bb_strong_threshold')
     def validate_percentages(cls, v):
         if v < 0 or v > 1:
             raise ValueError("Percentage values must be between 0 and 1")
@@ -181,16 +222,30 @@ class DynamicBBGridControllerConfigBase(ControllerConfigBase):
             raise ValueError(f"Invalid position mode: {v}. Valid options are: {', '.join(PositionMode.__members__)}")
         return v
 
+    @field_validator("candles_connector", mode="before")
+    @classmethod
+    def set_candles_connector(cls, v, validation_info: ValidationInfo):
+        if v is None or v == "":
+            return validation_info.data.get("connector_name")
+        return v
+
+    @field_validator("candles_trading_pair", mode="before")
+    @classmethod
+    def set_candles_trading_pair(cls, v, validation_info: ValidationInfo):
+        if v is None or v == "":
+            return validation_info.data.get("trading_pair")
+        return v
+
     def update_markets(self, markets: MarketDict) -> MarketDict:
         return markets.add_or_update(self.connector_name, self.trading_pair)
 
 
-class DynamicBBGridControllerBase(ControllerBase):
+class DynamicBBGridController(ControllerBase):
     """
     Base class for Dynamic BB-Grid trading strategies.
     """
 
-    def __init__(self, config: DynamicBBGridControllerConfigBase, *args, **kwargs):
+    def __init__(self, config: DynamicBBGridControllerConfig, *args, **kwargs):
         super().__init__(config, *args, **kwargs)
         self.config = config
 
@@ -205,6 +260,8 @@ class DynamicBBGridControllerBase(ControllerBase):
         self.final_stop_loss_price = None
         self.direction_buy = True
         self.reverse_order_open = False
+        self.stage = BBStage()
+        self.enable_reverse_order = False
 
         # Initialize market data provider
         self.market_data_provider.initialize_rate_sources([
@@ -214,265 +271,80 @@ class DynamicBBGridControllerBase(ControllerBase):
             )
         ])
 
-    def determine_executor_actions(self) -> List[ExecutorAction]:
+    async def update_processed_data(self):
         """
-        Main strategy logic with dynamic level management.
+        Update processed data with Bollinger Bands signal.
+        Generates both BUY and SELL signals based on Bollinger Bands position.
         """
-        actions = []
+        try:
+            # Get candles data
+            df = self.market_data_provider.get_candles_df(
+                connector_name=self.config.candles_connector,
+                trading_pair=self.config.candles_trading_pair,
+                interval=self.config.interval,
+                max_records=self.max_records + 1100
+            )
 
-        # Update filled executor states
-        self._update_executor_fill_states()
+            if df is None or len(df) < self.config.bb_length:
+                # Not enough data for BB calculation
+                self.logger().warning(f"Backtesting Debug: Insufficient data for BB calculation. Need {self.config.bb_length}, got {len(df) if df is not None else 0}")
+                self.processed_data = {
+                    "signal": 0,
+                    "features": df if df is not None else pd.DataFrame()
+                }
+                return
 
-        # Check and close expired executors
-        expired_actions = self._check_and_close_expired_executors()
-        if expired_actions:
-            self.logger().debug(f":: Found {len(expired_actions)} expired executors, returning early")
-            return expired_actions
+            # Calculate Bollinger Bands indicators
+            df.ta.bbands(
+                length=self.config.bb_length,
+                lower_std=self.config.bb_std,
+                upper_std=self.config.bb_std,
+                append=True
+            )
+            df.ta.rsi(length=14, append=True)
+            # current_price = self.market_data_provider.get_price_by_type(self.config.connector_name,self.config.trading_pair,PriceType.MidPrice)
+            bb_suffix = f"{self.config.bb_length}_{self.config.bb_std}_{self.config.bb_std}"
+            bbp_col = f"BBP_{bb_suffix}"
+            bbu_col = f"BBU_{bb_suffix}"
+            bbl_col = f"BBL_{bb_suffix}"
+            df["bbp"] = bbp = (df["close"] - df[bbl_col]) / (df[bbu_col] - df[bbl_col])
+            df["bbu"] = df[bbu_col]
+            df["bbl"] = df[bbl_col]
+            df["rsi"] = rsi = df["RSI_14"]
+            # Calculate Wilder's EMA components for real-time RSI calculation
+            # Calculate price changes and store previous price
+            df['prev_price'] = df['close'].shift(1)
+            df['price_change'] = df['close'].diff()
+            df['gain'] = df['price_change'].where(df['price_change'] > 0, 0)
+            df['loss'] = -df['price_change'].where(df['price_change'] < 0, 0)
 
-        has_stop_loss_hit = self._check_if_hit_final_stop_loss()
-        if has_stop_loss_hit and not self.reverse_order_open:
-            actions.extend(self.handle_stop_loss_hit())
-            return actions
-        elif not has_stop_loss_hit and self.reverse_order_open:
-            self.logger().debug(f"stop loss period ended, close reverse order")
-            actions.extend(self._close_all_positions_and_stop())
-            self.reverse_order_open = False
-            return actions
-        elif has_stop_loss_hit and self.reverse_order_open:
-            return actions
-            
-
-        #========= Check cooldown time before creating new executors
-        if not self._check_cooldown_time():
-            return actions
+            # Initialize avg_gain and avg_loss using Wilder's EMA method
+            alpha = 1.0 / 14  # Wilder's smoothing factor for 14-period RSI
+            df['avg_gain'] = df['gain'].ewm(alpha=alpha, adjust=False).mean()
+            df['avg_loss'] = df['loss'].ewm(alpha=alpha, adjust=False).mean()
         
-        signal_actions = self._handle_signal(self.processed_data)
-        actions.extend(signal_actions)
 
-        return actions
+            # Store processed data
+            self.processed_data = {
+                "features": df,
+                "bbp": df[bbp_col].iloc[-1],
+                "bbu": df[bbu_col].iloc[-1],
+                "bbl": df[bbl_col].iloc[-1],
+                "rsi": df["RSI_14"].iloc[-1],
+                "close": df["close"].iloc[-1],
+                "prev_price": df["prev_price"].iloc[-1],
+                "avg_gain": df["avg_gain"].iloc[-1],
+                "avg_loss": df["avg_loss"].iloc[-1]
+            }
 
-    def _check_cooldown_time(self) -> bool:
-        """
-        Check if enough time has passed since last executor creation.
-
-        Returns:
-            bool: True if cooldown period has passed, False otherwise
-        """
-        current_time = self.market_data_provider.time()
-        time_since_last_signal = current_time - self.last_executor_creation_time
-
-        if time_since_last_signal >= self.config.cooldown_time:
-            return True
-        else:
-            remaining_cooldown = self.config.cooldown_time - time_since_last_signal
-            self.logger().info(f":: No Signal Check, still in cooldown period. {remaining_cooldown:.1f}s remaining")
-            return False
-
-    def _calculate_signal(self, processed_data: any):
-        signal = 0
-
-        bbu = processed_data['bbu']
-        bbl = processed_data['bbl']
-        close_bt = processed_data['close']
-        rsi = processed_data["rsi"]
-        passed_bbp = processed_data["bbp"]
-        avg_gain = processed_data["avg_gain"]
-        prev_price = processed_data["prev_price"]
-        avg_loss = processed_data["avg_loss"]
-        current_price = self._get_current_price()
-        readable_time = datetime.fromtimestamp(processed_data["timestamp"]).strftime('%Y-%m-%d %H:%M:%S')
-        bbp = (float(current_price) - bbl)/(bbu - bbl)
-        bb_relative_width = (bbu - bbl) / bbu
-        bb_width_offset = -0.1
-        bb_width_threshold = 0.05
-        bb_width_multiplier_base = max(0.2, bb_relative_width / bb_width_threshold + bb_width_offset)
-        bb_width_multiplier_max = 1.5
-        bb_width_multiplier = min(bb_width_multiplier_base, bb_width_multiplier_max)
-
-        bb_long_threshold = 0.1
-        bb_short_threshold = 0.9
-
-        if bb_relative_width < bb_width_threshold:
-            bb_long_threshold = -0.1
-            bb_short_threshold = 1.1
-        
-        elif bb_relative_width < bb_width_threshold * 2:
-            bb_long_threshold = 0.1
-            bb_short_threshold = 0.9
-        else:
-            bb_long_threshold = 0.25
-            bb_short_threshold = 0.75
-
-        # Calculate real-time RSI using current price and stored averages
-        realtime_rsi = self._calculate_realtime_rsi(
-            close_bt, prev_price, avg_gain, avg_loss
-        )
-
-        # not accurate if it is lower than 4% of the bbu
-
-        if passed_bbp > bb_short_threshold:
-            signal = -1 * bb_width_multiplier
-        if passed_bbp < bb_long_threshold:
-            signal = 1 * bb_width_multiplier
-            
-        if not signal == 0:
-            self.logger().info(f"close_bt is {close_bt:.4f}, bbp is {bbp:.4f}, and bbu is {bbu:.4f}, and bbl is {bbl:.4f}")
-            self.logger().info(f"Time: {readable_time} | Signal: {signal} | BBP: {bbp:.4f} | price: {close_bt:.4f} | rsi: {realtime_rsi:.2f}")
-            self.logger().info(f"bb_long_threshold: {bb_long_threshold:.4f} | bb_short_threshold: {bb_short_threshold:.4f} | passed_bbp: {passed_bbp:.4f}")
-        return signal
-
-    def _calculate_realtime_rsi(self, current_price: Decimal, prev_price: float, prev_avg_gain: float, prev_avg_loss: float, period: int = 14) -> float:
-        # Calculate price change
-        price_change = float(current_price) - prev_price
-
-        # Separate gains and losses
-        gain = max(price_change, 0)
-        loss = max(-price_change, 0)
-
-        # Update averages using Wilder's method: new_avg = (old_avg * (n-1) + new_value) / n
-        new_avg_gain = (prev_avg_gain * (period - 1) + gain) / period
-        new_avg_loss = (prev_avg_loss * (period - 1) + loss) / period
-
-        # Calculate RSI
-        if new_avg_loss == 0:
-            rsi = 100.0
-        else:
-            rs = new_avg_gain / new_avg_loss
-            rsi = 100.0 - (100.0 / (1.0 + rs))
-
-        return rsi
-
-    def _handle_signal(self, processed_data: any) -> List[ExecutorAction]:
-        """
-        Handle new signal with dynamic level management.
-        """
-        actions = []
-        is_breakthrough = False
-
-        entry_price = 0
-
-        signal = 0
-
-        bbu = processed_data['bbu']
-        bbl = processed_data['bbl']
-        close_bt = processed_data['close']
-        rsi = processed_data["rsi"]
-        passed_bbp = processed_data["bbp"]
-        avg_gain = processed_data["avg_gain"]
-        prev_price = processed_data["prev_price"]
-        avg_loss = processed_data["avg_loss"]
-        current_price = self._get_current_price()
-        singapore_tz = pytz.timezone("Asia/Singapore")
-        readable_time = datetime.fromtimestamp(processed_data["timestamp"], tz=singapore_tz).strftime('%Y-%m-%d %H:%M:%S')
-        bbp = (float(current_price) - bbl)/(bbu - bbl)
-        bb_relative_width = (bbu - bbl) / bbu
-        bb_width_offset = -0.1
-        bb_width_threshold_weak = 0.025
-        bb_width_threshold_middle = 0.05
-        bb_width_threshold_strong = 0.1
-        bb_width_multiplier_base = max(0.2, bb_relative_width / bb_width_threshold_weak + bb_width_offset)
-        bb_width_multiplier_max = 1.5
-        bb_width_multiplier = min(bb_width_multiplier_base, bb_width_multiplier_max)
-
-        bb_long_threshold = 0.1
-        bb_short_threshold = 0.9
-
-        if bb_relative_width < bb_width_threshold_weak:
-            bb_long_threshold = -0.2
-            bb_short_threshold = 1.2
-            if passed_bbp > bb_short_threshold:
-                signal = 1 * bb_width_multiplier
-                is_breakthrough = True
-            if passed_bbp < bb_long_threshold:
-                signal = -1 * bb_width_multiplier
-                is_breakthrough = True
-            
-        elif bb_relative_width > bb_width_threshold_middle:
-            if bb_relative_width < bb_width_threshold_strong:
-                bb_long_threshold = 0
-                bb_short_threshold = 1
-            else:
-                bb_long_threshold = 0.2
-                bb_short_threshold = 0.8
-
-            if passed_bbp > bb_short_threshold:
-                signal = -1 * bb_width_multiplier
-            if passed_bbp < bb_long_threshold:
-                signal = 1 * bb_width_multiplier
-
-        if signal == 0:
-            return actions
-
-        self.logger().info(f"close_bt is {close_bt:.4f}, bbp is {bbp:.4f}, and bbu is {bbu:.4f}, and bbl is {bbl:.4f}")
-        self.logger().info(f"Time: {readable_time} | Signal: {signal} | BBP: {bbp:.4f} | price: {close_bt:.4f} | is_breakthrough: {is_breakthrough}")
-        self.logger().info(f"bb_long_threshold: {bb_long_threshold:.4f} | bb_short_threshold: {bb_short_threshold:.4f} | passed_bbp: {passed_bbp:.4f}")
- 
-
-        trade_side = TradeType.BUY if signal > 0 else TradeType.SELL
-        direction_buy = True if signal > 0 else False
-
-        #========= close unfilled levels
-        if self._get_total_position() != Decimal("0") and self.direction_buy != direction_buy:
-            self.logger().info(f"Important! Closing all positions and stopping due to direction change")
-            actions.extend(self._close_all_positions_and_stop())
-        else:
-            # Check if all levels are filled
-            if len(self.filled_executor_ids) >= self.config.level_number:
-                self.logger().info(f":: All levels filled ({len(self.filled_executor_ids)} >= {self.config.level_number}), waiting for profit/stop loss")
-                return actions  # All levels filled, wait for profit/stop loss
-
-            current_price = self._get_current_price()
-            if signal > 0:  # BUY signal
-                entry_price = current_price * (1 - self.config.accumulate_pct)
-            else:  # SELL signal
-                entry_price = current_price * (1 + self.config.accumulate_pct)
-
-            # Stop all unfilled executors and create new ones
-            stopped_actions = self._stop_unfilled_executor()
-            self.logger().debug(f":: Stopped {len(stopped_actions)} unfilled executors")
-            actions.extend(stopped_actions)
-
-        self.direction_buy = direction_buy
-
-        #========= Create new unfilled levels
-        unfilled_levels_number = self.config.level_number - len(self.filled_executor_ids)
-        self.logger().debug(f":: Creating {unfilled_levels_number} new executors")
-
-        for level_index in range(unfilled_levels_number):
-            action = self._create_level_executor(level_index, entry_price, trade_side, abs(signal), False)
-            if action:
-                self.logger().debug(f":: Created executor for level {level_index} and trade side is: {trade_side} from {entry_price:.4f} ")
-                actions.append(action)
-
-        # Update last signal time when executors are created
-        if actions:
-            self.last_executor_creation_time = self.market_data_provider.time()
-            self.logger().debug(f":: Updated last_signal_time, next signal allowed after {self.config.cooldown_time}s cooldown")
-
-        # Update final level prices after creating new levels
-        # self._update_final_level_prices()
-
-        self.logger().debug(f":: _handle_signal returning {len(actions)} actions")
-        return actions
-
-    def handle_stop_loss_hit(self) -> List[ExecutorAction]:
-        actions = []
-        actions.extend(self._close_all_positions_and_stop())
-        current_price = self._get_current_price()
-        trade_side = TradeType.SELL if self.direction_buy else TradeType.BUY
-        
-        enable_reverse_order = False
-        if enable_reverse_order:
-            for level_index in range(self.config.level_number):
-                action = self._create_level_executor(level_index, current_price, trade_side, 1, True)
-                if action:
-                    self.logger().info(f"Important! Reverse executor for level {level_index} and trade side is: {trade_side} at {current_price:.4f}")
-                    actions.append(action)   
-            self.reverse_order_open = True
-        return actions    
+        except Exception as e:
+            self.logger().error(f"Error updating processed data: {e}")
+            import traceback
+            self.logger().error(f"Backtesting Debug: Full traceback: {traceback.format_exc()}")
+            self.processed_data = {"signal": 0, "features": pd.DataFrame()}
 
     def _create_triple_barrier_config(self, direction_buy: bool, accumulate_price: Decimal,
-                                      profit_price: Decimal, stop_loss_price: Decimal) -> TripleBarrierConfig:
+                                      profit_price: Decimal, stop_loss_price: Decimal, is_reverse: bool = False) -> TripleBarrierConfig:
         """
         Create TripleBarrierConfig for a specific level.
         Converts price-based levels to percentage-based barriers.
@@ -493,10 +365,16 @@ class DynamicBBGridControllerBase(ControllerBase):
         take_profit_pct = abs(take_profit_pct)
         stop_loss_pct = abs(stop_loss_pct)
 
+        time_limit = self.config.stop_loss_waiting_time_hours * 3600 if is_reverse else self.config.time_limit_hours * 3600 
+
+
         return TripleBarrierConfig(
             take_profit=take_profit_pct,
             stop_loss=stop_loss_pct,
-            time_limit=self.config.time_limit_hours * 3600,  # Convert hours to seconds
+            # trailing_stop=TrailingStop(
+            #     activation_price = Decimal(0.004),
+            #     trailing_delta = Decimal(0.001)),
+            time_limit=time_limit,  # Convert hours to seconds
             open_order_type=OrderType.LIMIT,  # Entry order is limit order
             take_profit_order_type=OrderType.LIMIT,  # Profit at specific price level
             stop_loss_order_type=OrderType.MARKET,  # Stop loss triggers market order
@@ -509,7 +387,7 @@ class DynamicBBGridControllerBase(ControllerBase):
         """
         try:
             direction_multiplier = 1 if trade_side == TradeType.BUY else -1
-            reverse_direction_multiplier = 0 if is_reverse else 1
+            reverse_direction_multiplier = self.config.reverse_skew if is_reverse else 1
             # Calculate amount
             final_profit_level = entry_price * (
                 1 + direction_multiplier * self.config.level_number * self.config.profit_pct
@@ -517,13 +395,15 @@ class DynamicBBGridControllerBase(ControllerBase):
 
             final_accumulate_price = entry_price * (
                 1 - self.config.level_number * self.config.accumulate_pct *
-                direction_multiplier
+                direction_multiplier * reverse_direction_multiplier
             )
 
-            final_stop_loss_level = final_accumulate_price - (entry_price * direction_multiplier * self.config.level_number * self.config.stop_loss_pct)
+            final_stop_loss_level = final_accumulate_price - (
+                entry_price * direction_multiplier *
+                self.config.level_number * self.config.stop_loss_pct)
     
             accumulate_price = entry_price - (
-                level_index * self.config.accumulate_pct * entry_price *
+                min(level_index, 3) * self.config.accumulate_pct * entry_price *
                 direction_multiplier * reverse_direction_multiplier
             )
 
@@ -542,12 +422,12 @@ class DynamicBBGridControllerBase(ControllerBase):
 
             # Create triple barrier configuration
             triple_barrier = self._create_triple_barrier_config(trade_side == TradeType.BUY, 
-                accumulate_price, profit_price, stop_loss_price
+                accumulate_price, profit_price, stop_loss_price, is_reverse
             )
 
             amount = self.config.level_size / accumulate_price
 
-            self.logger().info(f"level size is: {self.config.level_size}, and accumulate_price is {accumulate_price}, and level_size_multiplier is {Decimal(level_size_multiplier)} and leverage is {self.config.leverage}, and amount is {amount * Decimal(level_size_multiplier)}, and profit price is {profit_price}, stop loss is{stop_loss_price}")
+            self.logger().debug(f"level size is: {self.config.level_size}, and accumulate_price is {accumulate_price}, and level_size_multiplier is {Decimal(level_size_multiplier)} and leverage is {self.config.leverage}, and amount is {amount * Decimal(level_size_multiplier)}, and profit price is {profit_price}, stop loss is{stop_loss_price}")
 
             # Create executor config
             executor_config = PositionExecutorConfig(
@@ -570,6 +450,27 @@ class DynamicBBGridControllerBase(ControllerBase):
             self.logger().error(f"Error creating level executor for level {level_index}: {e}")
             return None
 
+    def _calculate_realtime_rsi(self, current_price: Decimal, prev_price: float, prev_avg_gain: float, prev_avg_loss: float, period: int = 14) -> float:
+        # Calculate price change
+        price_change = float(current_price) - prev_price
+
+        # Separate gains and losses
+        gain = max(price_change, 0)
+        loss = max(-price_change, 0)
+
+        # Update averages using Wilder's method: new_avg = (old_avg * (n-1) + new_value) / n
+        new_avg_gain = (prev_avg_gain * (period - 1) + gain) / period
+        new_avg_loss = (prev_avg_loss * (period - 1) + loss) / period
+
+        # Calculate RSI
+        if new_avg_loss == 0:
+            rsi = 100.0
+        else:
+            rs = new_avg_gain / new_avg_loss
+            rsi = 100.0 - (100.0 / (1.0 + rs))
+
+        return rsi
+
     def _get_executor_by_id(self, executor_id: str):
         """Get executor by executor ID"""
         for executor in self.executors_info:
@@ -581,7 +482,7 @@ class DynamicBBGridControllerBase(ControllerBase):
         """Get list of unfilled (active) executor IDs"""
         unfilled_ids = []
         for executor in self.executors_info:
-            if executor.is_trading and executor.id in self.filled_executor_ids:
+            if executor.id in self.filled_executor_ids:
                 unfilled_ids.append(executor.id)
         return unfilled_ids
     
@@ -597,9 +498,10 @@ class DynamicBBGridControllerBase(ControllerBase):
         """Update filled executor states based on accumulation order fill status"""
         self.filled_executor_ids.clear()
         for executor in self.executors_info:
-            if executor.is_trading:
+            if executor.is_trading and executor.close_type != CloseType.EARLY_STOP:
                 # Accumulation order has started filling
                 self.filled_executor_ids.add(executor.id)
+        self.logger().debug(f'find {len(self.filled_executor_ids)} filled exectuors')
 
     def _check_and_close_expired_executors(self) -> List[ExecutorAction]:
         """Check for expired executors and close them"""
@@ -609,11 +511,10 @@ class DynamicBBGridControllerBase(ControllerBase):
 
         expired_executor_ids = []
         for executor in self.executors_info:
-            if (executor.is_active and
-                executor.id not in self.filled_executor_ids):
-
+            if (executor.is_active and executor.id not in self.filled_executor_ids):
                 # Check if executor has exceeded time limit
                 executor_age = current_time - executor.timestamp
+                self.logger().debug(f'current time {current_time} - executor.timestamp{executor.timestamp} = {executor_age}')
                 if executor_age > time_limit_seconds:
                     expired_executor_ids.append(executor.id)
                     actions.append(StopExecutorAction(
@@ -623,7 +524,7 @@ class DynamicBBGridControllerBase(ControllerBase):
 
         # TODO to be deleted after test
         if expired_executor_ids:
-            self.logger().info(f"Closing expired executors: {expired_executor_ids}")
+            self.logger().debug(f"Closing expired executors: {expired_executor_ids}")
 
         return actions
 
@@ -650,7 +551,7 @@ class DynamicBBGridControllerBase(ControllerBase):
                 executor_close_time = getattr(executor, 'close_timestamp', 0)
 
                 if executor_close_time > self.most_recent_stop_loss_time:
-                    self.logger().info(f"new top loss find, Stop loss waiting period active.")
+                    # self.logger().info(f"new top loss find, Stop loss waiting period active.")
                     self.most_recent_stop_loss_time = executor_close_time
 
         # Check if enough time has passed since the most recent stop loss
@@ -666,7 +567,7 @@ class DynamicBBGridControllerBase(ControllerBase):
         """Close all active positions"""
         actions = []
         for executor in self.executors_info:
-            if executor.is_trading or executor.is_active:
+            if executor.is_active:
                 actions.append(StopExecutorAction(
                     controller_id=self.config.id,
                     keep_position=False,
@@ -706,13 +607,11 @@ class DynamicBBGridControllerBase(ControllerBase):
 
     def _get_total_position(self) -> Decimal:
         """Get total position size"""
-        position_held = next(
-            (position for position in self.positions_held if
-             position.trading_pair == self.config.trading_pair and
-             position.connector_name == self.config.connector_name),
-            None
-        )
-        return position_held.amount if position_held else Decimal("0")
+        total_position = 0;
+        for executor in self.executors_info:
+            if executor.id in self.filled_executor_ids:
+                total_position = total_position + executor.filled_amount_quote
+        return total_position
 
     def _get_average_entry_price(self) -> Decimal:
         """Calculate average entry price of active positions"""
@@ -728,10 +627,75 @@ class DynamicBBGridControllerBase(ControllerBase):
 
     async def update_processed_data(self):
         """
-        Update processed data with signal information.
-        This method should be overridden by subclasses to implement specific signal logic.
+        Update processed data with Bollinger Bands signal.
+        Generates both BUY and SELL signals based on Bollinger Bands position.
         """
-        self.processed_data = {"signal": 0}
+        try:
+            # Get candles data
+            df = self.market_data_provider.get_candles_df(
+                connector_name=self.config.candles_connector,
+                trading_pair=self.config.candles_trading_pair,
+                interval=self.config.interval,
+                max_records=self.max_records + 1100
+            )
+
+            if df is None or len(df) < self.config.bb_length:
+                # Not enough data for BB calculation
+                self.logger().warning(f"Backtesting Debug: Insufficient data for BB calculation. Need {self.config.bb_length}, got {len(df) if df is not None else 0}")
+                self.processed_data = {
+                    "signal": 0,
+                    "features": df if df is not None else pd.DataFrame()
+                }
+                return
+
+            # Calculate Bollinger Bands indicators
+            df.ta.bbands(
+                length=self.config.bb_length,
+                lower_std=self.config.bb_std,
+                upper_std=self.config.bb_std,
+                append=True
+            )
+            df.ta.rsi(length=14, append=True)
+            # current_price = self.market_data_provider.get_price_by_type(self.config.connector_name,self.config.trading_pair,PriceType.MidPrice)
+            bb_suffix = f"{self.config.bb_length}_{self.config.bb_std}_{self.config.bb_std}"
+            bbp_col = f"BBP_{bb_suffix}"
+            bbu_col = f"BBU_{bb_suffix}"
+            bbl_col = f"BBL_{bb_suffix}"
+            df["bbp"] = bbp = (df["close"] - df[bbl_col]) / (df[bbu_col] - df[bbl_col])
+            df["bbu"] = df[bbu_col]
+            df["bbl"] = df[bbl_col]
+            df["rsi"] = rsi = df["RSI_14"]
+            # Calculate Wilder's EMA components for real-time RSI calculation
+            # Calculate price changes and store previous price
+            df['prev_price'] = df['close'].shift(1)
+            df['price_change'] = df['close'].diff()
+            df['gain'] = df['price_change'].where(df['price_change'] > 0, 0)
+            df['loss'] = -df['price_change'].where(df['price_change'] < 0, 0)
+
+            # Initialize avg_gain and avg_loss using Wilder's EMA method
+            alpha = 1.0 / 14  # Wilder's smoothing factor for 14-period RSI
+            df['avg_gain'] = df['gain'].ewm(alpha=alpha, adjust=False).mean()
+            df['avg_loss'] = df['loss'].ewm(alpha=alpha, adjust=False).mean()
+        
+
+            # Store processed data
+            self.processed_data = {
+                "features": df,
+                "bbp": df[bbp_col].iloc[-1],
+                "bbu": df[bbu_col].iloc[-1],
+                "bbl": df[bbl_col].iloc[-1],
+                "rsi": df["RSI_14"].iloc[-1],
+                "close": df["close"].iloc[-1],
+                "prev_price": df["prev_price"].iloc[-1],
+                "avg_gain": df["avg_gain"].iloc[-1],
+                "avg_loss": df["avg_loss"].iloc[-1]
+            }
+
+        except Exception as e:
+            self.logger().error(f"Error updating processed data: {e}")
+            import traceback
+            self.logger().error(f"Backtesting Debug: Full traceback: {traceback.format_exc()}")
+            self.processed_data = {"signal": 0, "features": pd.DataFrame()}
 
     def to_format_status(self) -> List[str]:
         """Get formatted status information"""
