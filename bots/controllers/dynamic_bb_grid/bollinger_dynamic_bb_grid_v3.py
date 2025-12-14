@@ -121,11 +121,7 @@ class BollingerDynamicBBGridV3Controller(DynamicBBGridController):
         bbu = processed_data['bbu']
         bbl = processed_data['bbl']
         close_bt = processed_data['close']
-        rsi = processed_data["rsi"]
         passed_bbp = processed_data["bbp"]
-        avg_gain = processed_data["avg_gain"]
-        prev_price = processed_data["prev_price"]
-        avg_loss = processed_data["avg_loss"]
         current_price = self._get_current_price()
         readable_time = datetime.fromtimestamp(self.market_data_provider.time()).strftime('%Y-%m-%d %H:%M:%S')
         # readable_time = datetime.fromtimestamp(processed_data["timestamp"]).strftime('%Y-%m-%d %H:%M:%S')
@@ -151,11 +147,6 @@ class BollingerDynamicBBGridV3Controller(DynamicBBGridController):
             bb_long_threshold = 0.25
             bb_short_threshold = 0.75
 
-        # Calculate real-time RSI using current price and stored averages
-        realtime_rsi = self._calculate_realtime_rsi(
-            close_bt, prev_price, avg_gain, avg_loss
-        )
-
         # not accurate if it is lower than 4% of the bbu
 
         if passed_bbp > bb_short_threshold:
@@ -165,8 +156,8 @@ class BollingerDynamicBBGridV3Controller(DynamicBBGridController):
             
         current_seconds = datetime.fromtimestamp(self.market_data_provider.time()).second
         if current_seconds == 0:
-            self.logger().info(f"close_bt is {close_bt:.4f}, bbp is {bbp:.4f}, and bbu is {bbu:.4f}, and bbl is {bbl:.4f}")
-            self.logger().info(f"Time: {readable_time} | Signal: {signal} | BBP: {bbp:.4f} | price: {close_bt:.4f} | rsi: {realtime_rsi:.2f}")
+            self.logger().debug(f"close_bt is {close_bt:.4f}, bbp is {bbp:.4f}, and bbu is {bbu:.4f}, and bbl is {bbl:.4f}")
+            self.logger().debug(f"Time: {readable_time} | Signal: {signal} | BBP: {bbp:.4f} | price: {close_bt:.4f}")
         return signal
 
     def _handle_signal(self, signal: int) -> List[ExecutorAction]:

@@ -125,11 +125,7 @@ class BollingerDynamicBBGridV4Controller(DynamicBBGridController):
         bbu = processed_data['bbu']
         bbl = processed_data['bbl']
         close_bt = processed_data['close']
-        rsi = processed_data["rsi"]
         passed_bbp = processed_data["bbp"]
-        avg_gain = processed_data["avg_gain"]
-        prev_price = processed_data["prev_price"]
-        avg_loss = processed_data["avg_loss"]
         current_price = self._get_current_price()
         readable_time = datetime.fromtimestamp(self.market_data_provider.time()).strftime('%Y-%m-%d %H:%M:%S')
         # readable_time = datetime.fromtimestamp(processed_data["timestamp"]).strftime('%Y-%m-%d %H:%M:%S')
@@ -141,18 +137,13 @@ class BollingerDynamicBBGridV4Controller(DynamicBBGridController):
         bb_width_multiplier_max = 1.5
         bb_width_multiplier = min(bb_width_multiplier_base, bb_width_multiplier_max)
 
-        # Calculate real-time RSI using current price and stored averages
-        realtime_rsi = self._calculate_realtime_rsi(
-            close_bt, prev_price, avg_gain, avg_loss
-        )
-
         signal = self.stage.get_signal(passed_bbp, bb_width_multiplier);
             
         current_seconds = datetime.fromtimestamp(self.market_data_provider.time()).second
         if current_seconds == 0 and signal != 0:          
-            self.logger().debug(f"Current Stage is {self.stage.name}, Signal is {signal:.4f}, and bbu is {bbu:.4f}, and bbl is {bbl:.4f}")
+            self.logger().info(f"Current Stage is {self.stage.name}, Signal is {signal:.4f}, and bbu is {bbu:.4f}, and bbl is {bbl:.4f}")
             self.logger().debug(f"close_bt is {close_bt:.4f}, bbp is {bbp:.4f}, and bbu is {bbu:.4f}, and bbl is {bbl:.4f}")
-            self.logger().debug(f"Time: {readable_time} | Signal: {signal} | BBP: {bbp:.4f} | price: {close_bt:.4f} | rsi: {realtime_rsi:.2f}")
+            self.logger().info(f"Time: {readable_time} | Signal: {signal} | BBP: {bbp:.4f} | price: {close_bt:.4f}")
         return signal
 
     def _handle_signal(self, signal: int) -> List[ExecutorAction]:
@@ -170,9 +161,9 @@ class BollingerDynamicBBGridV4Controller(DynamicBBGridController):
         trade_side = TradeType.BUY if signal > 0 else TradeType.SELL
         direction_buy = True if signal > 0 else False
 
-        self.logger().debug(f"current position is {self._get_total_position()}, and direction {self.direction_buy} - {direction_buy}")
+        self.logger().info(f"current position is {self._get_total_position()}, and direction {self.direction_buy} - {direction_buy}, current stage is {self.stage.name}")
         if self._get_total_position() != Decimal("0") and self.direction_buy != direction_buy:
-            self.logger().info(f"Important! Closing all positions and stopping due to direction change")
+            self.logger().debug(f"Important! Closing all positions and stopping due to direction change")
             self.direction_buy = direction_buy
             actions.extend(self._close_all_positions_and_stop())
             return actions
@@ -202,7 +193,7 @@ class BollingerDynamicBBGridV4Controller(DynamicBBGridController):
         for level_index in range(unfilled_levels_number):
             action = self._create_level_executor(level_index, entry_price, trade_side, abs(signal), False)
             if action:
-                self.logger().debug(f":: Created executor for level {level_index} and trade side is: {trade_side} from {entry_price:.4f} ")
+                self.logger().info(f":: Created executor for level {level_index} and trade side is: {trade_side} from {entry_price:.4f} ")
                 actions.append(action)
 
         # Update last signal time when executors are created

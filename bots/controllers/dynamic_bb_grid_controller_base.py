@@ -314,14 +314,14 @@ class DynamicBBGridController(ControllerBase):
             # Calculate Wilder's EMA components for real-time RSI calculation
             # Calculate price changes and store previous price
             df['prev_price'] = df['close'].shift(1)
-            df['price_change'] = df['close'].diff()
-            df['gain'] = df['price_change'].where(df['price_change'] > 0, 0)
-            df['loss'] = -df['price_change'].where(df['price_change'] < 0, 0)
+            # df['price_change'] = df['close'].diff()
+            # df['gain'] = df['price_change'].where(df['price_change'] > 0, 0)
+            # df['loss'] = -df['price_change'].where(df['price_change'] < 0, 0)
 
             # Initialize avg_gain and avg_loss using Wilder's EMA method
             alpha = 1.0 / 14  # Wilder's smoothing factor for 14-period RSI
-            df['avg_gain'] = df['gain'].ewm(alpha=alpha, adjust=False).mean()
-            df['avg_loss'] = df['loss'].ewm(alpha=alpha, adjust=False).mean()
+            # df['avg_gain'] = df['gain'].ewm(alpha=alpha, adjust=False).mean()
+            # df['avg_loss'] = df['loss'].ewm(alpha=alpha, adjust=False).mean()
         
 
             # Store processed data
@@ -333,8 +333,8 @@ class DynamicBBGridController(ControllerBase):
                 "rsi": df["RSI_14"].iloc[-1],
                 "close": df["close"].iloc[-1],
                 "prev_price": df["prev_price"].iloc[-1],
-                "avg_gain": df["avg_gain"].iloc[-1],
-                "avg_loss": df["avg_loss"].iloc[-1]
+                # "avg_gain": df["avg_gain"].iloc[-1],
+                # "avg_loss": df["avg_loss"].iloc[-1]
             }
 
         except Exception as e:
