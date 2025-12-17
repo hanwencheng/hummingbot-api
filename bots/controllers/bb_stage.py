@@ -63,23 +63,23 @@ class BBStage:
 
     @property
     def high_threshold(self):
-        return self.thresholds.get("high")
+        return self.thresholds["high"]
 
     @property
     def low_threshold(self):
-        return self.thresholds.get("low")
+        return self.thresholds["low"]
 
     @property
     def high_entry_threshold(self):
-        return self.thresholds.get("high_entry")
+        return self.thresholds["high_entry"]
 
     @property
     def low_entry_threshold(self):
-        return self.thresholds.get("low_entry")
+        return self.thresholds["low_entry"]
 
     def to_normal_stage(self):
         self.name = NORMAL_STAGE
-        self.threshold = BBStage._stages[NORMAL_STAGE]["thresholds"]
+        self.thresholds = BBStage._stages[NORMAL_STAGE]["thresholds"]
 
     def get_last_stage(self):
         last_stage = BBStage._stages[self.name]["last_stage"]

@@ -498,9 +498,10 @@ class DynamicBBGridController(ControllerBase):
         """Update filled executor states based on accumulation order fill status"""
         self.filled_executor_ids.clear()
         for executor in self.executors_info:
-            if executor.is_trading and executor.close_type != CloseType.EARLY_STOP:
+            if executor.is_trading and executor.close_type == None and executor.is_active:
                 # Accumulation order has started filling
                 self.filled_executor_ids.add(executor.id)
+                self.logger().debug(f'filled executor id with closeType: {executor.close_type} type {executor.type}, status {executor.status}, is_active {executor.is_active}, id: {executor.id}, close at: {executor.close_timestamp}')
         self.logger().debug(f'find {len(self.filled_executor_ids)} filled exectuors')
 
     def _check_and_close_expired_executors(self) -> List[ExecutorAction]:
@@ -551,7 +552,7 @@ class DynamicBBGridController(ControllerBase):
                 executor_close_time = getattr(executor, 'close_timestamp', 0)
 
                 if executor_close_time > self.most_recent_stop_loss_time:
-                    # self.logger().info(f"new top loss find, Stop loss waiting period active.")
+                    self.logger().info(f"new stop loss find {executor_close_time}, Stop loss waiting period active.")
                     self.most_recent_stop_loss_time = executor_close_time
 
         # Check if enough time has passed since the most recent stop loss

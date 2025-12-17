@@ -12,7 +12,7 @@ Advanced Bollinger Bands strategy with dynamic grid management:
 from decimal import Decimal
 from typing import List
 from hummingbot.strategy_v2.controllers.controller_base import ExecutorAction
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 
 from hummingbot.core.data_type.common import TradeType
 from hummingbot.data_feed.candles_feed.data_types import CandlesConfig
@@ -20,6 +20,9 @@ from ..dynamic_bb_grid_controller_base import (
     DynamicBBGridController,
     DynamicBBGridControllerConfig
 )
+
+def get_readable_time(timestamp: float) -> str:
+    return datetime.fromtimestamp(timestamp, tz=timezone(timedelta(hours=0))).strftime('%Y-%m-%d %H:%M:%S')
 
 
 class BollingerDynamicBBGridV4Config(DynamicBBGridControllerConfig):
@@ -127,8 +130,8 @@ class BollingerDynamicBBGridV4Controller(DynamicBBGridController):
         close_bt = processed_data['close']
         passed_bbp = processed_data["bbp"]
         current_price = self._get_current_price()
-        readable_time = datetime.fromtimestamp(self.market_data_provider.time()).strftime('%Y-%m-%d %H:%M:%S')
-        # readable_time = datetime.fromtimestamp(processed_data["timestamp"]).strftime('%Y-%m-%d %H:%M:%S')
+        
+        readable_time = get_readable_time(self.market_data_provider.time())
         bbp = (float(current_price) - bbl)/(bbu - bbl)
         bb_relative_width = (bbu - bbl) / bbu
         bb_width_offset = -0.1
@@ -140,10 +143,10 @@ class BollingerDynamicBBGridV4Controller(DynamicBBGridController):
         signal = self.stage.get_signal(passed_bbp, bb_width_multiplier);
             
         current_seconds = datetime.fromtimestamp(self.market_data_provider.time()).second
-        if current_seconds == 0 and signal != 0:          
-            self.logger().info(f"Current Stage is {self.stage.name}, Signal is {signal:.4f}, and bbu is {bbu:.4f}, and bbl is {bbl:.4f}")
+        if current_seconds == 0:          
+            self.logger().debug(f"Current Stage is {self.stage.name}, Signal is {signal:.4f}, and bbu is {bbu:.4f}, and bbl is {bbl:.4f}")
             self.logger().debug(f"close_bt is {close_bt:.4f}, bbp is {bbp:.4f}, and bbu is {bbu:.4f}, and bbl is {bbl:.4f}")
-            self.logger().info(f"Time: {readable_time} | Signal: {signal} | BBP: {bbp:.4f} | price: {close_bt:.4f}")
+            self.logger().debug(f"Time: {readable_time} | Signal: {signal} | BBP: {bbp:.4f} | price: {close_bt:.4f}")
         return signal
 
     def _handle_signal(self, signal: int) -> List[ExecutorAction]:
@@ -161,7 +164,7 @@ class BollingerDynamicBBGridV4Controller(DynamicBBGridController):
         trade_side = TradeType.BUY if signal > 0 else TradeType.SELL
         direction_buy = True if signal > 0 else False
 
-        self.logger().info(f"current position is {self._get_total_position()}, and direction {self.direction_buy} - {direction_buy}, current stage is {self.stage.name}")
+        self.logger().debug(f"current position is {self._get_total_position()}, and direction {self.direction_buy} - {direction_buy}, current stage is {self.stage.name}")
         if self._get_total_position() != Decimal("0") and self.direction_buy != direction_buy:
             self.logger().debug(f"Important! Closing all positions and stopping due to direction change")
             self.direction_buy = direction_buy
@@ -193,7 +196,7 @@ class BollingerDynamicBBGridV4Controller(DynamicBBGridController):
         for level_index in range(unfilled_levels_number):
             action = self._create_level_executor(level_index, entry_price, trade_side, abs(signal), False)
             if action:
-                self.logger().info(f":: Created executor for level {level_index} and trade side is: {trade_side} from {entry_price:.4f} ")
+                self.logger().debug(f":: Created executor for level {level_index} and trade side is: {trade_side} from {entry_price:.4f} ")
                 actions.append(action)
 
         # Update last signal time when executors are created
@@ -204,8 +207,7 @@ class BollingerDynamicBBGridV4Controller(DynamicBBGridController):
         return actions
 
     def handle_stop_loss_hit(self) -> List[ExecutorAction]:
-        actions = []
-        actions.extend(self._close_all_positions_and_stop())
+        actions = self._close_all_positions_and_stop()
         current_price = self._get_current_price()
         trade_side = TradeType.SELL if self.direction_buy else TradeType.BUY
         
