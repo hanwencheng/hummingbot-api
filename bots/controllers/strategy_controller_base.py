@@ -1,10 +1,8 @@
-import logging
 from decimal import Decimal
-from enum import Enum
-from typing import Dict, List, Optional, Union
-from pydantic import Field, field_validator, validator
+from typing import Dict, List, Optional
+from pydantic import Field, field_validator
 
-from hummingbot.core.data_type.common import OrderType, PositionMode, TradeType
+from hummingbot.core.data_type.common import OrderType, TradeType
 from hummingbot.data_feed.candles_feed.data_types import CandlesConfig
 from hummingbot.strategy_v2.controllers.controller_base import ControllerBase, ControllerConfigBase
 from hummingbot.strategy_v2.executors.data_types import ConnectorPair
