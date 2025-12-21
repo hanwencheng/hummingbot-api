@@ -1,12 +1,11 @@
-from typing import TypedDict, Dict
+from typing import TypedDict, List
 
 NORMAL_STAGE='normal'
 BREAKTHROUGH_STAGE='breakthrough'
 FALLBACK_STAGE='fallback'
 
 class BBStageThresholds(TypedDict):
-    high: float
-    low: float
+    bb: float
     entry_normal: float
     entry_follow: float
     entry_anti: float
@@ -16,38 +15,19 @@ class BBStage:
     Represents a Bollinger Band stage with thresholds, and provides transitions to the next and last stage.
     """
 
-    def generate_stages(self, bb_stage_thresholds_dict: Dict[str, BBStageThresholds]):
-        self.stages: Dict[str, BBStageThresholds] = {
-            NORMAL_STAGE: BBStageThresholds(
-                high=0.95,
-                low=0.05,
-                entry_normal=-0.005,
-                entry_follow=-0.01,
-                entry_anti=0,
-            ),
-            BREAKTHROUGH_STAGE: BBStageThresholds(
-                high=1.2,
-                low=-0.2,
-                entry_normal=0.015,
-                entry_follow=0.005,
-                entry_anti=0.025,
-            ),
-            FALLBACK_STAGE: BBStageThresholds(
-                high=1.3,
-                low=-0.3,
-                entry_normal=0.025,
-                entry_follow=0.025,
-                entry_anti=0.025,
-            ),
+    def generate_stages(self, bb_stage_thresholds_dict: List[BBStageThresholds]):
+        self.stages = {
+            NORMAL_STAGE: bb_stage_thresholds_dict[0],
+            BREAKTHROUGH_STAGE: bb_stage_thresholds_dict[1],
+            FALLBACK_STAGE: bb_stage_thresholds_dict[2]
         }
         
 
-    def __init__(self, weak_bandwidth: float, strong_bandwidth: float):
+    def __init__(self, macd_threshold: float, bb_stage_thresholds_dict: List[BBStageThresholds]):
         self.name = NORMAL_STAGE
-        self.generate_stages(weak_bandwidth, strong_bandwidth)
+        self.generate_stages(bb_stage_thresholds_dict)
         self.thresholds = self.stages[NORMAL_STAGE]
-        self.weak_bandwidth = weak_bandwidth
-        self.strong_bandwidth = strong_bandwidth
+        self.macd_threshold = macd_threshold
 
     def to_next_stage(self, stage_name: str):
         if stage_name not in self.stages:
@@ -66,9 +46,9 @@ class BBStage:
     def get_high_entry_threshold(self, current_price: float, stage_name: str, bbu: float, bbl: float, macd: float):
         if stage_name not in self.stages:
             raise ValueError(f"Invalid stage_name: {stage_name}. Must be one of {list[str](self.stages.keys())}.")
-        if macd/current_price > 0.005:
+        if macd/current_price > self.macd_threshold:
             return bbu + float(current_price) * self.stages[stage_name]["entry_follow"]
-        elif macd/current_price < -0.005:
+        elif macd/current_price < -self.macd_threshold:
             return bbu + float(current_price) * self.stages[stage_name]["entry_anti"]
         else:
             return bbu + float(current_price) * self.stages[stage_name]["entry_normal"]
@@ -77,38 +57,20 @@ class BBStage:
     def get_low_entry_threshold(self, current_price: float, stage_name: str, bbu: float, bbl: float, macd: float):
         if stage_name not in self.stages:
             raise ValueError(f"Invalid stage_name: {stage_name}. Must be one of {list[str](self.stages.keys())}.")
-        if macd/current_price > 0.005:
+        if macd/current_price > self.macd_threshold:
             return bbl - float(current_price) * self.stages[stage_name]["entry_anti"]
-        elif macd/current_price < -0.005:
+        elif macd/current_price < -self.macd_threshold:
             return bbl - float(current_price) * self.stages[stage_name]["entry_follow"]
         else:
             return bbl - float(current_price) * self.stages[stage_name]["entry_normal"]
 
-    def get_high_threshold(self, stage_name: str):
-        if stage_name not in self.stages:
-            raise ValueError(f"Invalid stage_name: {stage_name}. Must be one of {list[str](self.stages.keys())}.")
-        return self.stages[stage_name]["high"]
-    
-    def get_low_threshold(self, stage_name: str):
-        if stage_name not in self.stages:
-            raise ValueError(f"Invalid stage_name: {stage_name}. Must be one of {list[str](self.stages.keys())}.")
-        return self.stages[stage_name]["low"]
-
     @property
     def high_threshold(self):
-        return self.thresholds["high"]
+        return 1 + self.thresholds["bb"]
 
     @property
     def low_threshold(self):
-        return self.thresholds["low"]
-
-    @property
-    def high_entry_threshold(self):
-        return self.thresholds["high_entry"]
-
-    @property
-    def low_entry_threshold(self):
-        return self.thresholds["low_entry"]
+        return 0 - self.thresholds["bb"]
 
     def to_normal_stage(self):
         self.name = NORMAL_STAGE

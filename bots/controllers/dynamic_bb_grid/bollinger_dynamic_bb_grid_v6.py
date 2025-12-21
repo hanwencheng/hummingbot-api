@@ -13,10 +13,11 @@ from decimal import Decimal
 from typing import List
 from hummingbot.strategy_v2.controllers.controller_base import ExecutorAction
 from datetime import datetime, timedelta, timezone
-
 from hummingbot.core.data_type.common import TradeType
 from hummingbot.data_feed.candles_feed.data_types import CandlesConfig
-from ..bb_stage_v6 import BBStage
+
+from pydantic import Field
+from ..bb_stage_v6 import BBStage, BBStageThresholds
 from ..dynamic_bb_grid_controller_base import (
     DynamicBBGridController,
     DynamicBBGridControllerConfig
@@ -26,11 +27,101 @@ def get_readable_time(timestamp: float) -> str:
     return datetime.fromtimestamp(timestamp, tz=timezone(timedelta(hours=0))).strftime('%Y-%m-%d %H:%M:%S')
 
 
-class BollingerDynamicBBGridV4Config(DynamicBBGridControllerConfig):
-    controller_name: str = "bollinger_dynamic_bb_grid_v4"
+class BollingerDynamicBBGridV6Config(DynamicBBGridControllerConfig):
+    controller_name: str = "bollinger_dynamic_bb_grid_v6"
+    normal_stage_bb: float = Field(
+        default=-0.05,
+        json_schema_extra={
+            "prompt": "Enter the Bollinger Bands standard deviation: ",
+            "prompt_on_new": True
+        }
+    )
+    normal_entry_normal: float = Field(
+        default=-0.005,
+        json_schema_extra={
+            "prompt": "Enter the Bollinger Bands standard deviation: ",
+            "prompt_on_new": True
+        }
+    )
+    normal_entry_follow: float = Field(
+        default=-0.01,
+        json_schema_extra={
+            "prompt": "Enter the Bollinger Bands standard deviation: ",
+            "prompt_on_new": True
+        }
+    )
+    normal_entry_anti: float = Field(
+        default=0,
+        json_schema_extra={
+            "prompt": "Enter the Bollinger Bands standard deviation: ",
+            "prompt_on_new": True
+        }
+    )
+    breakthrough_stage_bb: float = Field(
+        default=0.2,
+        json_schema_extra={
+            "prompt": "Enter the Bollinger Bands standard deviation: ",
+            "prompt_on_new": True
+        }
+    )
+    breakthrough_entry_normal: float = Field(
+        default=0.015,
+        json_schema_extra={
+            "prompt": "Enter the Bollinger Bands standard deviation: ",
+            "prompt_on_new": True
+        }
+    )
+    breakthrough_entry_follow: float = Field(
+        default=0.005,
+        json_schema_extra={
+            "prompt": "Enter the Bollinger Bands standard deviation: ",
+            "prompt_on_new": True
+        }
+    )
+    breakthrough_entry_anti: float = Field(
+        default=0.025,
+        json_schema_extra={
+            "prompt": "Enter the Bollinger Bands standard deviation: ",
+            "prompt_on_new": True
+        }
+    )    
+    fallback_stage_bb: float = Field(
+        default=0.3,
+        json_schema_extra={
+            "prompt": "Enter the Bollinger Bands standard deviation: ",
+            "prompt_on_new": True
+        }
+    )
+    fallback_entry_normal: float = Field(
+        default=0.025,
+        json_schema_extra={
+            "prompt": "Enter the Bollinger Bands standard deviation: ",
+            "prompt_on_new": True
+        }
+    )
+    fallback_entry_follow: float = Field(
+        default=0.025,
+        json_schema_extra={
+            "prompt": "Enter the Bollinger Bands standard deviation: ",
+            "prompt_on_new": True
+        }
+    )
+    fallback_entry_anti: float = Field(
+        default=0.025,
+        json_schema_extra={
+            "prompt": "Enter the Bollinger Bands standard deviation: ",
+            "prompt_on_new": True
+        }
+    )
+    macd_threshold: float = Field(
+        default=0.005,
+        json_schema_extra={
+            "prompt": "Enter the Bollinger Bands standard deviation: ",
+            "prompt_on_new": True
+        }
+    )        
 
-
-class BollingerDynamicBBGridV4Controller(DynamicBBGridController):
+class BollingerDynamicBBGridV6Controller(DynamicBBGridController):
     """
     Bollinger Bands Dynamic BB-Grid Strategy Controller.
 
@@ -39,9 +130,29 @@ class BollingerDynamicBBGridV4Controller(DynamicBBGridController):
     - All levels filled = wait for profit/stop loss targets
     """
 
-    def __init__(self, config: BollingerDynamicBBGridV4Config, *args, **kwargs):
+    def __init__(self, config: BollingerDynamicBBGridV6Config, *args, **kwargs):
         super().__init__(config, *args, **kwargs)
-        self.stage = BBStage(0.008, 0.03)
+        bb_stage_thresholds_dict = [
+            BBStageThresholds(
+                bb = self.config.normal_stage_bb,
+                entry_normal=self.config.normal_entry_normal,
+                entry_follow=self.config.normal_entry_follow,
+                entry_anti=self.config.normal_entry_anti,
+            ),
+            BBStageThresholds(
+                bb = self.config.breakthrough_stage_bb,
+                entry_normal=self.config.breakthrough_entry_normal,
+                entry_follow=self.config.breakthrough_entry_follow,
+                entry_anti=self.config.breakthrough_entry_anti,
+            ),
+            BBStageThresholds(
+                bb = self.config.fallback_stage_bb,
+                entry_normal=self.config.fallback_entry_normal,
+                entry_follow=self.config.fallback_entry_follow,
+                entry_anti=self.config.fallback_entry_anti,
+            )
+        ]
+        self.stage = BBStage(config.macd_threshold, bb_stage_thresholds_dict)
         self.config.controller_name = config.controller_name
         self.max_records = self.config.bb_length + 20 # Extra buffer for BB calculation
         # Set up candles config if not provided
