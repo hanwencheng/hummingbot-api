@@ -35,7 +35,6 @@ from hummingbot.strategy_v2.executors.position_executor.data_types import Positi
 from hummingbot.strategy_v2.models.executor_actions import CreateExecutorAction, ExecutorAction, StopExecutorAction
 from hummingbot.strategy_v2.models.executors import CloseType
 from hummingbot.core.data_type.common import MarketDict
-from .bb_stage import BBStage
 
 class DynamicBBGridControllerConfig(ControllerConfigBase):
     """
@@ -260,7 +259,6 @@ class DynamicBBGridController(ControllerBase):
         self.final_stop_loss_price = None
         self.direction_buy = True
         self.reverse_order_open = False
-        self.stage = BBStage()
         self.enable_reverse_order = False
 
         # Initialize market data provider
@@ -301,9 +299,15 @@ class DynamicBBGridController(ControllerBase):
                 upper_std=self.config.bb_std,
                 append=True
             )
+            macd_fast = 720
+            macd_slow = 1560
+            macd_signal = 540
+            df.ta.macd(fast=macd_fast, slow=macd_slow, signal=macd_signal, append=True)
             df.ta.rsi(length=14, append=True)
             # current_price = self.market_data_provider.get_price_by_type(self.config.connector_name,self.config.trading_pair,PriceType.MidPrice)
             bb_suffix = f"{self.config.bb_length}_{self.config.bb_std}_{self.config.bb_std}"
+            macdh = df[f"MACDh_{macd_fast}_{macd_slow}_{macd_signal}"]
+            macd = df[f"MACD_{macd_fast}_{macd_slow}_{macd_signal}"]
             bbp_col = f"BBP_{bb_suffix}"
             bbu_col = f"BBU_{bb_suffix}"
             bbl_col = f"BBL_{bb_suffix}"
@@ -311,6 +315,8 @@ class DynamicBBGridController(ControllerBase):
             df["bbu"] = df[bbu_col]
             df["bbl"] = df[bbl_col]
             df["rsi"] = rsi = df["RSI_14"]
+            df["macd"] = macd
+            df["macdh"] = macdh
             # Calculate Wilder's EMA components for real-time RSI calculation
             # Calculate price changes and store previous price
             df['prev_price'] = df['close'].shift(1)
@@ -333,6 +339,8 @@ class DynamicBBGridController(ControllerBase):
                 "rsi": df["RSI_14"].iloc[-1],
                 "close": df["close"].iloc[-1],
                 "prev_price": df["prev_price"].iloc[-1],
+                "macd": macd.iloc[-1],
+                "macdh": macdh.iloc[-1]
                 # "avg_gain": df["avg_gain"].iloc[-1],
                 # "avg_loss": df["avg_loss"].iloc[-1]
             }
@@ -626,77 +634,6 @@ class DynamicBBGridController(ControllerBase):
 
         return total_value / total_amount if total_amount > 0 else Decimal("0")
 
-    async def update_processed_data(self):
-        """
-        Update processed data with Bollinger Bands signal.
-        Generates both BUY and SELL signals based on Bollinger Bands position.
-        """
-        try:
-            # Get candles data
-            df = self.market_data_provider.get_candles_df(
-                connector_name=self.config.candles_connector,
-                trading_pair=self.config.candles_trading_pair,
-                interval=self.config.interval,
-                max_records=self.max_records + 1100
-            )
-
-            if df is None or len(df) < self.config.bb_length:
-                # Not enough data for BB calculation
-                self.logger().warning(f"Backtesting Debug: Insufficient data for BB calculation. Need {self.config.bb_length}, got {len(df) if df is not None else 0}")
-                self.processed_data = {
-                    "signal": 0,
-                    "features": df if df is not None else pd.DataFrame()
-                }
-                return
-
-            # Calculate Bollinger Bands indicators
-            df.ta.bbands(
-                length=self.config.bb_length,
-                lower_std=self.config.bb_std,
-                upper_std=self.config.bb_std,
-                append=True
-            )
-            df.ta.rsi(length=14, append=True)
-            # current_price = self.market_data_provider.get_price_by_type(self.config.connector_name,self.config.trading_pair,PriceType.MidPrice)
-            bb_suffix = f"{self.config.bb_length}_{self.config.bb_std}_{self.config.bb_std}"
-            bbp_col = f"BBP_{bb_suffix}"
-            bbu_col = f"BBU_{bb_suffix}"
-            bbl_col = f"BBL_{bb_suffix}"
-            df["bbp"] = bbp = (df["close"] - df[bbl_col]) / (df[bbu_col] - df[bbl_col])
-            df["bbu"] = df[bbu_col]
-            df["bbl"] = df[bbl_col]
-            df["rsi"] = rsi = df["RSI_14"]
-            # Calculate Wilder's EMA components for real-time RSI calculation
-            # Calculate price changes and store previous price
-            df['prev_price'] = df['close'].shift(1)
-            df['price_change'] = df['close'].diff()
-            df['gain'] = df['price_change'].where(df['price_change'] > 0, 0)
-            df['loss'] = -df['price_change'].where(df['price_change'] < 0, 0)
-
-            # Initialize avg_gain and avg_loss using Wilder's EMA method
-            alpha = 1.0 / 14  # Wilder's smoothing factor for 14-period RSI
-            df['avg_gain'] = df['gain'].ewm(alpha=alpha, adjust=False).mean()
-            df['avg_loss'] = df['loss'].ewm(alpha=alpha, adjust=False).mean()
-        
-
-            # Store processed data
-            self.processed_data = {
-                "features": df,
-                "bbp": df[bbp_col].iloc[-1],
-                "bbu": df[bbu_col].iloc[-1],
-                "bbl": df[bbl_col].iloc[-1],
-                "rsi": df["RSI_14"].iloc[-1],
-                "close": df["close"].iloc[-1],
-                "prev_price": df["prev_price"].iloc[-1],
-                "avg_gain": df["avg_gain"].iloc[-1],
-                "avg_loss": df["avg_loss"].iloc[-1]
-            }
-
-        except Exception as e:
-            self.logger().error(f"Error updating processed data: {e}")
-            import traceback
-            self.logger().error(f"Backtesting Debug: Full traceback: {traceback.format_exc()}")
-            self.processed_data = {"signal": 0, "features": pd.DataFrame()}
 
     def to_format_status(self) -> List[str]:
         """Get formatted status information"""

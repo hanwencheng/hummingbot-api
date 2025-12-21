@@ -16,8 +16,7 @@ from datetime import datetime, timedelta, timezone
 
 from hummingbot.core.data_type.common import TradeType
 from hummingbot.data_feed.candles_feed.data_types import CandlesConfig
-
-from ..bb_stage_v4 import BBStage
+from ..bb_stage_v6 import BBStage
 from ..dynamic_bb_grid_controller_base import (
     DynamicBBGridController,
     DynamicBBGridControllerConfig
@@ -42,7 +41,7 @@ class BollingerDynamicBBGridV4Controller(DynamicBBGridController):
 
     def __init__(self, config: BollingerDynamicBBGridV4Config, *args, **kwargs):
         super().__init__(config, *args, **kwargs)
-        self.stage = BBStage()
+        self.stage = BBStage(0.008, 0.03)
         self.config.controller_name = config.controller_name
         self.max_records = self.config.bb_length + 20 # Extra buffer for BB calculation
         # Set up candles config if not provided
@@ -132,7 +131,8 @@ class BollingerDynamicBBGridV4Controller(DynamicBBGridController):
         bbl = processed_data['bbl']
         close_bt = processed_data['close']
         passed_bbp = processed_data["bbp"]
-        current_price = self._get_current_price()
+        current_price = float(self._get_current_price())
+        macd = processed_data["macd"]
         
         readable_time = get_readable_time(self.market_data_provider.time())
         bbp = (float(current_price) - bbl)/(bbu - bbl)
@@ -143,12 +143,12 @@ class BollingerDynamicBBGridV4Controller(DynamicBBGridController):
         bb_width_multiplier_max = 1.5
         bb_width_multiplier = min(bb_width_multiplier_base, bb_width_multiplier_max)
 
-        signal = self.stage.get_signal(passed_bbp, bb_width_multiplier);
+        signal = self.stage.get_signal(current_price, passed_bbp, bbu, bbl, bb_width_multiplier, macd);
             
         current_seconds = datetime.fromtimestamp(self.market_data_provider.time()).second
         if current_seconds == 0 and signal != 0:          
             self.logger().info(f"Current Stage is {self.stage.name}, Signal is {signal:.4f}, and bbu is {bbu:.4f}, and bbl is {bbl:.4f}")
-            self.logger().debug(f"close_bt is {close_bt:.4f}, bbp is {bbp:.4f}, and bbu is {bbu:.4f}, and bbl is {bbl:.4f}")
+            self.logger().info(f"price upper diff is {(current_price - bbu)/current_price:.4f}, lower diff is {(current_price - bbl)/current_price:.4f}, macd is {macd/current_price:.4f}")
             self.logger().info(f"Time: {readable_time} | Signal: {signal} | BBP: {bbp:.4f} | price: {close_bt:.4f}")
         return signal
 
