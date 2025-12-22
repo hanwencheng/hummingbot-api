@@ -181,21 +181,22 @@ class MinimalOptimizer:
             logger.info(f"Trial {trial.number}: Sampled parameters: {params}")
 
             # Execute backtest and wait for actual completion
-            result = self.execute_backtest_request(params, trial.number)
+            response_data = self.execute_backtest_request(params, trial.number)
 
-            if "error" in result:
-                logger.error(f"Trial {trial.number} failed: {result['error']}")
+            if "error" in response_data:
+                logger.error(f"Trial {trial.number} failed: {response_data['error']}")
                 return 0.0
 
             # Check if result has the expected structure
-            if "results" not in result:
-                logger.error(f"Trial {trial.number} - Unexpected response structure: {result}")
+            if "results" not in response_data:
+                logger.error(f"Trial {trial.number} - Unexpected response structure: {response_data}")
                 return 0.0
 
             # Extract results
-            results = result.get("results", {})
+            results = response_data.get("results", {})
+            logger.info(f"result is {results}")
             pnl = float(results.get("net_pnl", 0))
-            accuracy = float(result.get("accuracy", 0))
+            accuracy = float(response_data.get("accuracy", 0))
             total_trades = int(results.get("total_orders", 0))
 
             # Simple objective: just use PnL normalized
