@@ -11,16 +11,18 @@ sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 from scripts.minimal_optimization_poc import MinimalOptimizer
 
 def main():
-    print("🚀 Starting Minimal Optimization POC")
-    print("📊 This will run 3 trials with 2-second delays between requests")
-    print("⏱️  Expected time: ~6-10 minutes total")
+    print("🚀 Starting TRUE SEQUENTIAL Optimization POC")
+    print("🔄 Each trial waits for ACTUAL completion of previous trial")
+    print("⏱️  No artificial delays - pure request completion detection")
+    print("🎯 Testing 3 BB stage parameters: normal_stage_bb, breakthrough_stage_bb, fallback_stage_bb")
     print()
 
     optimizer = MinimalOptimizer()
 
     try:
-        optimizer.run_optimization(n_trials=3)
-        print("\n✅ Optimization completed! Check 'minimal_optimization_results/' for results")
+        optimizer.run_sequential_optimization(n_trials=3)
+        print("\n✅ TRUE SEQUENTIAL optimization completed!")
+        print("📁 Check 'minimal_optimization_results/' for detailed results")
     except KeyboardInterrupt:
         print("\n⚠️  Optimization interrupted by user")
     except Exception as e:

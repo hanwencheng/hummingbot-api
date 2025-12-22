@@ -4,7 +4,6 @@ Minimal POC for Bayesian Optimization with rate limiting
 Tests the backtesting endpoint with controlled request frequency
 """
 
-import asyncio
 import requests
 import optuna
 import time
@@ -25,8 +24,7 @@ logger = logging.getLogger(__name__)
 API_BASE_URL = "http://localhost:8000"
 USERNAME = "admin"
 PASSWORD = "admin"
-REQUEST_DELAY = 2.0  # 2 seconds between requests
-TIMEOUT = 120.0  # 2 minutes timeout per request
+TIMEOUT = 300.0  # 5 minutes timeout per request
 MAX_RETRIES = 2
 
 def generate_auth_header(username: str, password: str) -> str:
@@ -110,8 +108,8 @@ class MinimalOptimizer:
 
         return start_timestamp, end_timestamp
 
-    def run_single_backtest(self, params: dict, trial_number: int) -> dict:
-        """Run a single backtest with rate limiting and retries"""
+    def execute_backtest_request(self, params: dict, trial_number: int) -> dict:
+        """Execute a single backtest request and wait for actual completion"""
         start_time, end_time = self.get_test_period()
 
         # Create config
@@ -126,54 +124,47 @@ class MinimalOptimizer:
             'config': config
         }
 
-        logger.info(f"Trial {trial_number}: Starting backtest with params: {params}")
+        logger.info(f"Trial {trial_number}: Executing backtest with {len(params)} optimized parameters")
 
         for retry in range(MAX_RETRIES + 1):
             try:
-                # Add delay before each request (except first trial)
-                if trial_number > 0 or retry > 0:
-                    logger.info(f"Trial {trial_number}: Waiting {REQUEST_DELAY}s before request...")
-                    time.sleep(REQUEST_DELAY)
+                logger.info(f"Trial {trial_number}: Sending request to backend (attempt {retry + 1}/{MAX_RETRIES + 1})")
+                request_start_time = time.time()
 
-                logger.info(f"Trial {trial_number}: Sending POST request to /backtesting/run-backtesting")
-
+                # This blocks until the request is COMPLETELY finished
                 response = self.session.post(
                     f"{API_BASE_URL}/backtesting/run-backtesting",
                     json=backtest_config,
                     timeout=TIMEOUT
                 )
 
+                request_duration = time.time() - request_start_time
+
                 if response.status_code == 200:
                     result = response.json()
-                    logger.info(f"Trial {trial_number}: Backtest completed successfully")
-                    logger.debug(f"Trial {trial_number}: Response keys: {list(result.keys())}")
+                    logger.info(f"Trial {trial_number}: ✅ Request completed in {request_duration:.2f}s - Backend fully processed and ready")
                     return result
                 else:
-                    logger.warning(f"Trial {trial_number}: HTTP {response.status_code}: {response.text}")
+                    error_msg = f"HTTP {response.status_code}: {response.text}"
+                    logger.warning(f"Trial {trial_number}: ❌ Request failed - {error_msg}")
                     if retry < MAX_RETRIES:
-                        wait_time = (retry + 1) * 5  # 5, 10, 15 seconds
-                        logger.info(f"Trial {trial_number}: Retrying in {wait_time}s...")
-                        time.sleep(wait_time)
+                        logger.info(f"Trial {trial_number}: Retrying immediately...")
                         continue
                     else:
-                        return {"error": f"HTTP {response.status_code}: {response.text}"}
+                        return {"error": error_msg}
 
             except requests.exceptions.Timeout:
-                logger.error(f"Trial {trial_number}: Request timeout (retry {retry}/{MAX_RETRIES})")
+                logger.error(f"Trial {trial_number}: ⏰ Request timeout after {TIMEOUT}s")
                 if retry < MAX_RETRIES:
-                    wait_time = (retry + 1) * 10  # 10, 20, 30 seconds
-                    logger.info(f"Trial {trial_number}: Retrying in {wait_time}s...")
-                    time.sleep(wait_time)
+                    logger.info(f"Trial {trial_number}: Retrying immediately...")
                     continue
                 else:
                     return {"error": "Request timeout"}
 
             except Exception as e:
-                logger.error(f"Trial {trial_number}: Request failed: {str(e)}")
+                logger.error(f"Trial {trial_number}: 💥 Request failed: {str(e)}")
                 if retry < MAX_RETRIES:
-                    wait_time = (retry + 1) * 5
-                    logger.info(f"Trial {trial_number}: Retrying in {wait_time}s...")
-                    time.sleep(wait_time)
+                    logger.info(f"Trial {trial_number}: Retrying immediately...")
                     continue
                 else:
                     return {"error": str(e)}
@@ -181,15 +172,16 @@ class MinimalOptimizer:
         return {"error": "Max retries exceeded"}
 
     def objective_function(self, trial: optuna.Trial) -> float:
-        """Objective function with proper error handling"""
-        trial_start = time.time()
+        """Objective function that waits for actual request completion"""
+        trial_start_time = time.time()
 
         try:
-            # Sample minimal parameters
+            # Sample the 3 BB stage parameters
             params = self.sample_minimal_parameters(trial)
+            logger.info(f"Trial {trial.number}: Sampled parameters: {params}")
 
-            # Run backtest
-            result = self.run_single_backtest(params, trial.number)
+            # Execute backtest and wait for actual completion
+            result = self.execute_backtest_request(params, trial.number)
 
             if "error" in result:
                 logger.error(f"Trial {trial.number} failed: {result['error']}")
@@ -203,18 +195,20 @@ class MinimalOptimizer:
             # Extract results
             results = result.get("results", {})
             pnl = float(results.get("net_pnl", 0))
+            accuracy = float(result.get("accuracy", 0))
             total_trades = int(results.get("total_orders", 0))
 
             # Simple objective: just use PnL normalized
-            score = max(-1.0, min(1.0, pnl / 100.0))  # Normalize to [-1, 1]
+            score = pnl  # already normalized
 
-            execution_time = time.time() - trial_start
+            execution_time = time.time() - trial_start_time
 
             # Save result
             result_data = {
                 'trial_number': trial.number,
                 'params': params,
                 'pnl': pnl,
+                'accuracy': accuracy,
                 'total_trades': total_trades,
                 'score': score,
                 'execution_time': execution_time,
@@ -226,34 +220,53 @@ class MinimalOptimizer:
             with open(self.results_dir / filename, 'w') as f:
                 json.dump(result_data, f, indent=2)
 
-            logger.info(f"Trial {trial.number} completed: Score={score:.4f}, PnL={pnl:.2f}, Time={execution_time:.1f}s")
+            logger.info(f"Trial {trial.number}: ✅ Completed in {execution_time:.1f}s - Score={score:.4f}, PnL={pnl:.2f}")
             return score
 
         except Exception as e:
-            logger.error(f"Trial {trial.number} error: {str(e)}")
+            logger.error(f"Trial {trial.number}: 💥 Error: {str(e)}")
             return 0.0
 
-    def run_optimization(self, n_trials: int = 3):
-        """Run minimal optimization with just a few trials"""
-        logger.info(f"Starting minimal optimization with {n_trials} trials")
-        logger.info(f"Request delay: {REQUEST_DELAY}s, Timeout: {TIMEOUT}s")
+    def run_sequential_optimization(self, n_trials: int = 3):
+        """Run optimization with TRUE sequential execution - no artificial delays"""
+        logger.info(f"🚀 Starting TRUE SEQUENTIAL optimization with {n_trials} trials")
+        logger.info(f"🔄 Each trial waits for ACTUAL completion of previous trial")
+        logger.info(f"⏱️  No artificial delays - pure request completion detection")
 
-        # Create simple study
         study = optuna.create_study(direction="maximize")
 
-        for trial_num in range(n_trials):
-            logger.info(f"\n=== Starting Trial {trial_num + 1}/{n_trials} ===")
+        for trial_index in range(n_trials):
+            trial_number = trial_index + 1
+            logger.info(f"\n{'='*60}")
+            logger.info(f"🎯 TRIAL {trial_number}/{n_trials}")
+            logger.info(f"{'='*60}")
 
             try:
+                # Get trial from Optuna
                 trial = study.ask()
+                logger.info(f"Trial {trial.number}: 🎲 Parameters sampled by Optuna")
+
+                # Execute objective function - this blocks until request completes
+                logger.info(f"Trial {trial.number}: 🔄 Starting execution (will block until complete)...")
                 objective_value = self.objective_function(trial)
+
+                # Only reaches here when request is FULLY complete
+                logger.info(f"Trial {trial.number}: ✅ FULLY COMPLETED - Backend ready for next trial")
+
+                # Tell Optuna the result
                 study.tell(trial, objective_value)
 
+                # Show current best
                 if study.best_trial:
-                    logger.info(f"Best so far: Score={study.best_value:.4f}, Params={study.best_params}")
+                    logger.info(f"🏆 Current Best: Score={study.best_value:.4f}")
+                    logger.info(f"🎯 Best Params: {study.best_params}")
+
+                # Ready for next trial immediately - no delays needed
+                if trial_number < n_trials:
+                    logger.info(f"✅ Trial {trial.number} complete - Backend ready for next trial")
 
             except Exception as e:
-                logger.error(f"Trial {trial_num} failed completely: {str(e)}")
+                logger.error(f"Trial {trial_number}: 💥 Failed completely: {str(e)}")
                 continue
 
         # Final results
@@ -280,12 +293,12 @@ class MinimalOptimizer:
         self.session.close()
 
 def main():
-    """Main function to run the minimal optimization"""
+    """Main function to run the TRUE sequential optimization"""
     optimizer = MinimalOptimizer()
 
     try:
-        # Test with just 3 trials first
-        optimizer.run_optimization(n_trials=3)
+        # Test with 3 trials - true sequential execution
+        optimizer.run_sequential_optimization(n_trials=3)
     finally:
         optimizer.close()
 

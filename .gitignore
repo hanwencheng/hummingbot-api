@@ -2,6 +2,8 @@
 __pycache__/
 *.py[cod]
 *$py.class
+minimal_optimization_results
+optimization_results
 
 # C extensions
 *.so
