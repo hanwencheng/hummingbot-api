@@ -20,7 +20,7 @@ def main():
     optimizer = MinimalOptimizer()
 
     try:
-        optimizer.run_sequential_optimization(n_trials=10)
+        optimizer.run_sequential_optimization(n_trials=100)
         print("\n✅ TRUE SEQUENTIAL optimization completed!")
         print("📁 Check 'minimal_optimization_results/' for detailed results")
     except KeyboardInterrupt:

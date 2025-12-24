@@ -560,7 +560,7 @@ class DynamicBBGridController(ControllerBase):
                 executor_close_time = getattr(executor, 'close_timestamp', 0)
 
                 if executor_close_time > self.most_recent_stop_loss_time:
-                    self.logger().info(f"new stop loss find {executor_close_time}, Stop loss waiting period active.")
+                    self.logger().debug(f"new stop loss find {executor_close_time}, Stop loss waiting period active.")
                     self.most_recent_stop_loss_time = executor_close_time
 
         # Check if enough time has passed since the most recent stop loss

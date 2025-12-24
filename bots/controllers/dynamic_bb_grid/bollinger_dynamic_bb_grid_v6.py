@@ -154,7 +154,7 @@ class BollingerDynamicBBGridV6Controller(DynamicBBGridController):
         ]
         self.stage = BBStage(config.macd_threshold, bb_stage_thresholds_dict)
         self.config.controller_name = config.controller_name
-        self.max_records = self.config.bb_length + 20 # Extra buffer for BB calculation
+        self.max_records = self.config.bb_length + 50000 # Extra buffer for BB calculation
         # Set up candles config if not provided
         if len(self.config.candles_config) == 0:
             self.config.candles_config = [
@@ -258,9 +258,9 @@ class BollingerDynamicBBGridV6Controller(DynamicBBGridController):
             
         current_seconds = datetime.fromtimestamp(self.market_data_provider.time()).second
         if current_seconds == 0 and signal != 0:          
-            self.logger().info(f"Current Stage is {self.stage.name}, Signal is {signal:.4f}, and bbu is {bbu:.4f}, and bbl is {bbl:.4f}")
-            self.logger().info(f"price upper diff is {(current_price - bbu)/current_price:.4f}, lower diff is {(current_price - bbl)/current_price:.4f}, macd is {macd/current_price:.4f}")
-            self.logger().info(f"Time: {readable_time} | Signal: {signal} | BBP: {bbp:.4f} | price: {close_bt:.4f}")
+            self.logger().debug(f"Current Stage is {self.stage.name}, Signal is {signal:.4f}, and bbu is {bbu:.4f}, and bbl is {bbl:.4f}")
+            self.logger().debug(f"price upper diff is {(current_price - bbu)/current_price:.4f}, lower diff is {(current_price - bbl)/current_price:.4f}, macd is {macd/current_price:.4f}")
+            self.logger().debug(f"Time: {readable_time} | Signal: {signal} | BBP: {bbp:.4f} | price: {close_bt:.4f}")
         return signal
 
     def _handle_signal(self, signal: int) -> List[ExecutorAction]:
