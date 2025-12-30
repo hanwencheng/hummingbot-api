@@ -177,3 +177,4 @@ bots/conf/scripts/
 # IDE files
 .vscode/
 .idea/
+bots/conf/.DS_Store
