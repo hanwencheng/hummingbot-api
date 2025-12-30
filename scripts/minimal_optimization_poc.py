@@ -191,23 +191,28 @@ class MinimalOptimizer:
 
         # Create timestamped subdirectory for this test run
         timestamp = datetime.now().strftime("%m-%d-%H-%M")
-        trading_pair = "HYPE-USDT"  # From base_config
+        trading_pair = "SOL-USDT"  # From base_config
         test_dir_name = f"{trading_pair}_{timestamp}"
 
         self.results_dir = Path("minimal_optimization_results") / test_dir_name
         self.results_dir.mkdir(parents=True, exist_ok=True)
 
+        # Global rate limiting - persists across all trials
+        self.global_request_times = []  # Track all request start times globally
+        self.requests_per_group = get_requests_per_group(Backtesting_Interval) * 2
+
         logger.info(f"Initialized with auth header for user: {USERNAME}")
         logger.info(f"Results will be saved to: {self.results_dir}")
+        logger.info(f"Global rate limiting: {self.requests_per_group} requests per group (60s window)")
 
         # Simple base config for testing - using bollinger_dynamic_bb_grid_v6 for the 3 BB stage parameters
         self.base_config = {
             'controller_name': 'bollinger_dynamic_bb_grid_v6',
             'controller_type': 'dynamic_bb_grid',
             'connector_name': 'binance_perpetual',
-            'trading_pair': 'HYPE-USDT',
+            'trading_pair': 'SOL-USDT',
             'candles_connector': 'binance_perpetual',
-            'candles_trading_pair': 'HYPE-USDT',
+            'candles_trading_pair': 'SOL-USDT',
             'interval': Backtesting_Interval,
             'position_mode': 'ONEWAY',
             'profit_skew': 1,
@@ -273,6 +278,28 @@ class MinimalOptimizer:
 
         logger.info(f"📊 Total monthly periods: {len(periods)}")
         return periods
+
+    def apply_global_rate_limit(self, trial_number: int, month_num: int = None) -> None:
+        """Apply global rate limiting across all trials and requests"""
+        current_time = time.time()
+
+        # Check if we need to wait based on global requests per group
+        if len(self.global_request_times) >= self.requests_per_group:
+            # Check if we need to wait for the next minute window
+            oldest_request_in_group = self.global_request_times[-(self.requests_per_group)]
+            time_since_group_start = current_time - oldest_request_in_group
+
+            if time_since_group_start < 60.0:
+                wait_time = 60.0 - time_since_group_start
+                context = f"Month {month_num}" if month_num else "Request"
+                logger.info(f"Trial {trial_number}, {context}: Global rate limiting - waiting {wait_time:.1f} more seconds...")
+                logger.info(f"Total requests so far: {len(self.global_request_times)}, Group limit: {self.requests_per_group}")
+                time.sleep(wait_time)
+                current_time = time.time()
+
+        # Record this request time globally
+        self.global_request_times.append(current_time)
+        return current_time
 
     def execute_monthly_backtest(self, params: dict, start_time: int, end_time: int, month_num: int, trial_number: int) -> Optional[BacktestResults]:
         """Execute a single monthly backtest and return typed results"""
@@ -347,37 +374,18 @@ class MinimalOptimizer:
         return None
 
     def execute_aggregated_backtest(self, params: dict, trial_number: int) -> AggregatedResults:
-        """Execute monthly backtests and aggregate results"""
+        """Execute monthly backtests and aggregate results with global rate limiting"""
         trial_start_time = time.time()
         periods = self.get_test_periods()
 
-        # Calculate timing based on backtesting interval
-        requests_per_group = get_requests_per_group(Backtesting_Interval) * 2
-
         logger.info(f"Trial {trial_number}: Executing {len(periods)} monthly backtests with {len(params)} optimized parameters: {list(params.keys())}")
-        logger.info(f"Trial {trial_number}: Using {Backtesting_Interval} interval, {requests_per_group} requests per group")
+        logger.info(f"Trial {trial_number}: Using global rate limiting - {self.requests_per_group} requests per 60s window")
 
         monthly_results = []
-        request_times = []  # Track all request start times
 
         for month_num, (start_time, end_time) in enumerate(periods, 1):
-            current_time = time.time()
-
-            # Check if we need to wait based on requests per group
-            if len(request_times) >= requests_per_group:
-                # Check if we need to wait for the next minute window
-                oldest_request_in_group = request_times[-(requests_per_group)]
-                time_since_group_start = current_time - oldest_request_in_group
-
-                if time_since_group_start < 60.0:
-                    wait_time = 60.0 - time_since_group_start
-                    logger.info(f"Trial {trial_number}: Ensuring 1-minute group interval for {Backtesting_Interval} - waiting {wait_time:.1f} more seconds...")
-                    time.sleep(wait_time)
-                    current_time = time.time()
-
-            # Record when we start this request
-            request_start_time = current_time
-            request_times.append(request_start_time)
+            # Apply global rate limiting before each request
+            request_start_time = self.apply_global_rate_limit(trial_number, month_num)
 
             monthly_result = self.execute_monthly_backtest(params, start_time, end_time, month_num, trial_number)
 
@@ -398,6 +406,7 @@ class MinimalOptimizer:
 
         logger.info(f"Trial {trial_number}: ✅ Aggregated {len(monthly_results)}/{len(periods)} months")
         logger.info(f"Trial {trial_number}: Total execution time: {execution_time:.2f}s")
+        logger.info(f"Trial {trial_number}: Global requests so far: {len(self.global_request_times)}")
         logger.info(f"Trial {trial_number}: Total PnL={aggregated.total_pnl:.4f}, Total Accuracy={aggregated.total_accuracy:.4f}, CV={aggregated.cv_pnl:.4f}")
 
         return aggregated
