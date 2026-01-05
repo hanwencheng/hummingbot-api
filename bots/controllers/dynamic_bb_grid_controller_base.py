@@ -16,16 +16,21 @@ Key Logic:
 - All levels filled = wait for profit/stop loss, ignore new signals
 - Time limit triggers closure of incomplete levels
 - Stop loss hit = wait for stop_loss_waiting_time before next signal
+
+Signal System:
+- Pluggable signal providers (Telegram, Copy Trading, Technical Indicators)
+- Signal aggregation with multiple strategies (priority, weighted, majority)
+- Each provider can contribute signals independently
 """
 
 from decimal import Decimal
-from typing import List, Optional
+from typing import Any, Dict, List, Optional
 from pydantic import Field, field_validator
 from datetime import datetime
 from pydantic_core.core_schema import ValidationInfo
 
 import pandas as pd
-import pandas_ta as ta 
+import pandas_ta as ta
 
 from hummingbot.core.data_type.common import OrderType, PositionMode, TradeType, PriceType
 from hummingbot.data_feed.candles_feed.data_types import CandlesConfig
@@ -35,6 +40,15 @@ from hummingbot.strategy_v2.executors.position_executor.data_types import Positi
 from hummingbot.strategy_v2.models.executor_actions import CreateExecutorAction, ExecutorAction, StopExecutorAction
 from hummingbot.strategy_v2.models.executors import CloseType
 from hummingbot.core.data_type.common import MarketDict
+
+# Signal system imports
+from .signals import (
+    Signal,
+    SignalType,
+    SignalProvider,
+    SignalAggregator,
+    BollingerBandSignalProvider,
+)
 
 class DynamicBBGridControllerConfig(ControllerConfigBase):
     """
@@ -205,6 +219,35 @@ class DynamicBBGridControllerConfig(ControllerConfigBase):
         }
     )
 
+    # Signal aggregation configuration
+    signal_aggregation_mode: str = Field(
+        default="priority",
+        json_schema_extra={
+            "prompt": "Signal aggregation mode (priority, weighted_average, unanimous, majority, first_valid):",
+            "prompt_on_new": False
+        }
+    )
+    use_external_signals: bool = Field(
+        default=False,
+        json_schema_extra={
+            "prompt": "Enable external signal providers (Telegram, Copy Trading, etc.):",
+            "prompt_on_new": False
+        }
+    )
+    external_signal_weight: float = Field(
+        default=1.0,
+        json_schema_extra={
+            "prompt": "Weight for external signals in aggregation (0.0-1.0):",
+            "prompt_on_new": False
+        }
+    )
+    bb_signal_weight: float = Field(
+        default=1.0,
+        json_schema_extra={
+            "prompt": "Weight for Bollinger Band signals in aggregation (0.0-1.0):",
+            "prompt_on_new": False
+        }
+    )
 
     @field_validator('accumulate_pct', 'profit_pct', 'stop_loss_pct', 'profit_skew', 'stop_loss_skew', 'reverse_skew', 'bb_weak_threshold', 'bb_strong_threshold')
     def validate_percentages(cls, v):
@@ -242,6 +285,15 @@ class DynamicBBGridControllerConfig(ControllerConfigBase):
 class DynamicBBGridController(ControllerBase):
     """
     Base class for Dynamic BB-Grid trading strategies.
+
+    Signal System:
+    - Uses SignalAggregator to combine signals from multiple providers
+    - Built-in BollingerBandSignalProvider for technical analysis
+    - Extensible with external providers (Telegram, Copy Trading, etc.)
+
+    To add external signal providers:
+        controller.add_signal_provider(TelegramSignalProvider(...))
+        controller.add_signal_provider(HyperliquidCopyTradingProvider(...))
     """
 
     def __init__(self, config: DynamicBBGridControllerConfig, *args, **kwargs):
@@ -269,10 +321,120 @@ class DynamicBBGridController(ControllerBase):
             )
         ])
 
+        # Initialize signal aggregator
+        self._init_signal_system()
+
+    def _init_signal_system(self):
+        """Initialize the signal aggregation system"""
+        # Map config string to enum
+        mode_map = {
+            "priority": SignalAggregator.AggregationMode.PRIORITY,
+            "weighted_average": SignalAggregator.AggregationMode.WEIGHTED_AVERAGE,
+            "unanimous": SignalAggregator.AggregationMode.UNANIMOUS,
+            "majority": SignalAggregator.AggregationMode.MAJORITY,
+            "first_valid": SignalAggregator.AggregationMode.FIRST_VALID,
+        }
+        aggregation_mode = mode_map.get(
+            self.config.signal_aggregation_mode,
+            SignalAggregator.AggregationMode.PRIORITY
+        )
+
+        self.signal_aggregator = SignalAggregator(mode=aggregation_mode)
+
+        # Add built-in Bollinger Band signal provider
+        bb_provider = BollingerBandSignalProvider(
+            name="bollinger_bands",
+            weight=self.config.bb_signal_weight,
+            enabled=True,
+            bb_length=self.config.bb_length,
+            bb_std=self.config.bb_std,
+            bb_weak_threshold=self.config.bb_weak_threshold,
+            bb_strong_threshold=self.config.bb_strong_threshold,
+        )
+        self.signal_aggregator.add_provider(bb_provider, priority=0)
+
+        # Store current signal for access
+        self._current_signal: Optional[Signal] = None
+
+    def add_signal_provider(self, provider: SignalProvider, priority: int = 10):
+        """
+        Add an external signal provider to the aggregator.
+
+        Args:
+            provider: SignalProvider instance (TelegramSignalProvider, CopyTradingProvider, etc.)
+            priority: Priority for signal aggregation (higher = more important, default 10)
+
+        Example:
+            from signals import TelegramSignalProvider, HyperliquidCopyTradingProvider
+
+            # Add Telegram signal provider
+            telegram = TelegramSignalProvider(
+                bot_token="your_bot_token",
+                chat_ids=[123456789],
+                target_pair="BTC-USDT"
+            )
+            controller.add_signal_provider(telegram, priority=20)
+
+            # Add copy trading provider
+            copy_trader = HyperliquidCopyTradingProvider(
+                watched_addresses=["0x..."],
+                min_trade_size_usd=5000,
+                target_tokens=["BTC", "ETH"]
+            )
+            controller.add_signal_provider(copy_trader, priority=15)
+        """
+        # Set weight from config if it's an external provider
+        if self.config.use_external_signals:
+            provider.weight = self.config.external_signal_weight
+
+        self.signal_aggregator.add_provider(provider, priority=priority)
+        self.logger().info(f"Added signal provider: {provider.name} (priority={priority}, weight={provider.weight})")
+
+    def remove_signal_provider(self, name: str):
+        """Remove a signal provider by name"""
+        self.signal_aggregator.remove_provider(name)
+        self.logger().info(f"Removed signal provider: {name}")
+
+    def get_signal_provider(self, name: str) -> Optional[SignalProvider]:
+        """Get a signal provider by name"""
+        return self.signal_aggregator.get_provider(name)
+
+    @property
+    def current_signal(self) -> Optional[Signal]:
+        """Get the current aggregated signal"""
+        return self._current_signal
+
+    @property
+    def signal_providers(self) -> List[SignalProvider]:
+        """Get all registered signal providers"""
+        return self.signal_aggregator.providers
+
+    async def start_signal_providers(self):
+        """Start all signal providers (call this when controller starts)"""
+        await self.signal_aggregator.start_all()
+
+    async def stop_signal_providers(self):
+        """Stop all signal providers (call this when controller stops)"""
+        await self.signal_aggregator.stop_all()
+
     async def update_processed_data(self):
         """
-        Update processed data with Bollinger Bands signal.
-        Generates both BUY and SELL signals based on Bollinger Bands position.
+        Update processed data with market indicators and aggregated signals.
+
+        This method:
+        1. Fetches candle data and calculates technical indicators (BB, MACD, RSI)
+        2. Prepares market_data dictionary for signal providers
+        3. Gets aggregated signal from all registered providers
+        4. Stores everything in processed_data for strategy use
+
+        Signal providers receive market_data with:
+        - bbp, bbu, bbl: Bollinger Band values
+        - rsi: RSI indicator
+        - macd, macdh: MACD indicator
+        - close: Current close price
+        - current_price: Real-time mid price
+        - features: Full DataFrame with all indicators
+        - connector_name, trading_pair: Market identifiers
         """
         try:
             # Get candles data
@@ -304,46 +466,85 @@ class DynamicBBGridController(ControllerBase):
             macd_signal = 540
             df.ta.macd(fast=macd_fast, slow=macd_slow, signal=macd_signal, append=True)
             df.ta.rsi(length=14, append=True)
-            # current_price = self.market_data_provider.get_price_by_type(self.config.connector_name,self.config.trading_pair,PriceType.MidPrice)
+
             bb_suffix = f"{self.config.bb_length}_{self.config.bb_std}_{self.config.bb_std}"
             macdh = df[f"MACDh_{macd_fast}_{macd_slow}_{macd_signal}"]
             macd = df[f"MACD_{macd_fast}_{macd_slow}_{macd_signal}"]
             bbp_col = f"BBP_{bb_suffix}"
             bbu_col = f"BBU_{bb_suffix}"
             bbl_col = f"BBL_{bb_suffix}"
-            df["bbp"] = bbp = (df["close"] - df[bbl_col]) / (df[bbu_col] - df[bbl_col])
+            df["bbp"] = (df["close"] - df[bbl_col]) / (df[bbu_col] - df[bbl_col])
             df["bbu"] = df[bbu_col]
             df["bbl"] = df[bbl_col]
-            df["rsi"] = rsi = df["RSI_14"]
+            df["rsi"] = df["RSI_14"]
             df["macd"] = macd
             df["macdh"] = macdh
-            # Calculate Wilder's EMA components for real-time RSI calculation
-            # Calculate price changes and store previous price
             df['prev_price'] = df['close'].shift(1)
-            # df['price_change'] = df['close'].diff()
-            # df['gain'] = df['price_change'].where(df['price_change'] > 0, 0)
-            # df['loss'] = -df['price_change'].where(df['price_change'] < 0, 0)
 
-            # Initialize avg_gain and avg_loss using Wilder's EMA method
-            alpha = 1.0 / 14  # Wilder's smoothing factor for 14-period RSI
-            # df['avg_gain'] = df['gain'].ewm(alpha=alpha, adjust=False).mean()
-            # df['avg_loss'] = df['loss'].ewm(alpha=alpha, adjust=False).mean()
-        
+            # Get current price
+            current_price = self._get_current_price()
 
-            # Store processed data
-            self.processed_data = {
-                "features": df,
+            # Prepare market data for signal providers
+            market_data: Dict[str, Any] = {
+                # Bollinger Bands
                 "bbp": df[bbp_col].iloc[-1],
                 "bbu": df[bbu_col].iloc[-1],
                 "bbl": df[bbl_col].iloc[-1],
+                # Other indicators
                 "rsi": df["RSI_14"].iloc[-1],
+                "macd": macd.iloc[-1],
+                "macdh": macdh.iloc[-1],
+                # Prices
                 "close": df["close"].iloc[-1],
                 "prev_price": df["prev_price"].iloc[-1],
-                "macd": macd.iloc[-1],
-                "macdh": macdh.iloc[-1]
-                # "avg_gain": df["avg_gain"].iloc[-1],
-                # "avg_loss": df["avg_loss"].iloc[-1]
+                "current_price": current_price,
+                # Full data
+                "features": df,
+                # Market identifiers
+                "connector_name": self.config.connector_name,
+                "trading_pair": self.config.trading_pair,
             }
+
+            # Get aggregated signal from all providers
+            aggregated_signal = await self.signal_aggregator.get_aggregated_signal(market_data)
+            self._current_signal = aggregated_signal
+
+            # Convert signal to numeric value for backward compatibility
+            signal_value = 0
+            if aggregated_signal.signal_type == SignalType.BUY:
+                signal_value = 1
+            elif aggregated_signal.signal_type == SignalType.SELL:
+                signal_value = -1
+
+            # Store processed data
+            self.processed_data = {
+                # Signal data
+                "signal": signal_value,
+                "signal_object": aggregated_signal,
+                "signal_strength": aggregated_signal.strength,
+                "signal_source": aggregated_signal.source,
+                "signal_entry_price": aggregated_signal.entry_price,
+                "signal_metadata": aggregated_signal.metadata,
+                # Market data
+                "features": df,
+                "bbp": market_data["bbp"],
+                "bbu": market_data["bbu"],
+                "bbl": market_data["bbl"],
+                "rsi": market_data["rsi"],
+                "close": market_data["close"],
+                "prev_price": market_data["prev_price"],
+                "current_price": current_price,
+                "macd": market_data["macd"],
+                "macdh": market_data["macdh"],
+            }
+
+            # Log signal information
+            if signal_value != 0:
+                self.logger().debug(
+                    f"Signal: {aggregated_signal.signal_type.name} "
+                    f"(strength={aggregated_signal.strength:.2f}, "
+                    f"source={aggregated_signal.source})"
+                )
 
         except Exception as e:
             self.logger().error(f"Error updating processed data: {e}")
@@ -653,7 +854,18 @@ class DynamicBBGridController(ControllerBase):
         # Current signal and entry price
         signal = self.processed_data.get("signal", 0)
         signal_str = "BUY" if signal > 0 else "SELL" if signal < 0 else "HOLD"
-        status.append(f"Signal: {signal_str} ({signal})")
+        signal_strength = self.processed_data.get("signal_strength", 0)
+        signal_source = self.processed_data.get("signal_source", "N/A")
+        status.append(f"Signal: {signal_str} (strength={signal_strength:.2f}, source={signal_source})")
+
+        # Signal providers info
+        if self.signal_providers:
+            providers_info = ", ".join([
+                f"{p.name}({'on' if p.enabled else 'off'})"
+                for p in self.signal_providers
+            ])
+            status.append(f"Signal Providers: {providers_info}")
+            status.append(f"Aggregation Mode: {self.config.signal_aggregation_mode}")
 
         # Level info
         status.append(f"Filled Levels: {len(self.filled_executor_ids)} / {self.config.level_number}")
