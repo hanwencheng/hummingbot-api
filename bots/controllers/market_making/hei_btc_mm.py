@@ -215,7 +215,10 @@ class HEIBTCMMController(ControllerBase):
         self._update_executor_states()
 
         if self.current_state == self.STATES["INITIAL"]:
-            if spread > self.config.min_tick:
+            if self._should_trigger_sell(buy_1_price, spread):
+                actions.extend(self._place_active_sell_order(buy_1_price))
+                self.logger().info(f"INITIAL -> SELL_ACTIVE: Volume threshold met at minimum spread, selling")
+            elif spread > self.config.min_tick:
                 actions.extend(self._place_buy_1_order(sell_1_price))
                 self.last_sell_1_price = sell_1_price
                 self.logger().info(f"INITIAL -> BUY_1_ACTIVE: Placing buy_1 at {sell_1_price - self.config.min_tick}")
@@ -227,9 +230,9 @@ class HEIBTCMMController(ControllerBase):
                 self.last_sell_1_price = sell_1_price
                 self.logger().info(f"BUY_1_ACTIVE -> BUY_2_ACTIVE: buy_1 filled, placing buy_2")
 
-            elif self._should_trigger_sell():
+            elif self._should_trigger_sell(buy_1_price, spread):
                 actions.extend(self._cancel_order(self.buy_1_order_id))
-                actions.extend(self._place_active_sell_order())
+                actions.extend(self._place_active_sell_order(buy_1_price))
                 self.logger().info(f"BUY_1_ACTIVE -> SELL_ACTIVE: Volume threshold met, selling")
 
             elif price_changed and spread > self.config.min_tick:
@@ -343,14 +346,17 @@ class HEIBTCMMController(ControllerBase):
 
         return is_filled
 
-    def _should_trigger_sell(self) -> bool:
-        """Check if sell should be triggered based on volume at buy_1 price"""
-        if self.current_order_price <= Decimal("0"):
+    def _should_trigger_sell(self, best_bid: Decimal, spread: Decimal) -> bool:
+        """Check if sell should be triggered based on volume at best bid when spread is minimum"""
+        if spread > self.config.min_tick:
             return False
 
-        volume_at_price = self._get_volume_at_price(self.current_order_price, True)
-        should_sell = volume_at_price >= self.config.market_sell_threshold
-        self.logger().info(f"[_should_trigger_sell] volume_at_price={volume_at_price}, threshold={self.config.market_sell_threshold}, should_sell={should_sell}")
+        if best_bid <= Decimal("0"):
+            return False
+
+        volume_at_bid = self._get_volume_at_price(best_bid, True)
+        should_sell = volume_at_bid >= self.config.market_sell_threshold
+        self.logger().info(f"[_should_trigger_sell] best_bid={best_bid}, spread={spread}, volume={volume_at_bid}, threshold={self.config.market_sell_threshold}, should_sell={should_sell}")
         return should_sell
 
     def _was_sell_filled_or_partial(self) -> bool:
@@ -432,11 +438,11 @@ class HEIBTCMMController(ControllerBase):
 
         return [action]
 
-    def _place_active_sell_order(self) -> List[ExecutorAction]:
-        """Place market sell order when volume threshold is met"""
-        volume_at_price = self._get_volume_at_price(self.current_order_price, True)
-        sell_amount = volume_at_price / Decimal("2")
-        self.logger().info(f"[_place_active_sell_order] volume_at_price={volume_at_price}, sell_amount={sell_amount}")
+    def _place_active_sell_order(self, best_bid: Decimal) -> List[ExecutorAction]:
+        """Place market sell order when volume threshold is met at best bid"""
+        volume_at_bid = self._get_volume_at_price(best_bid, True)
+        sell_amount = volume_at_bid / Decimal("2")
+        self.logger().info(f"[_place_active_sell_order] best_bid={best_bid}, volume_at_bid={volume_at_bid}, sell_amount={sell_amount}")
 
         if not self._check_hourly_limit(sell_amount):
             self.logger().warning(f"[_place_active_sell_order] Hourly sell limit exceeded, skipping sell")
@@ -448,7 +454,7 @@ class HEIBTCMMController(ControllerBase):
             trading_pair=self.config.trading_pair,
             side=TradeType.SELL,
             amount=sell_amount,
-            price=self.current_order_price,
+            price=best_bid,
             execution_strategy=ExecutionStrategy.MARKET,
             level_id=f"active_sell_{int(time.time())}"
         )
