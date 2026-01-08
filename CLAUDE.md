@@ -6,6 +6,23 @@ This guide shows you how to interact with the Hummingbot API using Claude (claud
 1. the market data has to be updated in `update_processed_data` function, this is the function to be called by every update circle. The market data is updated in `self.processed_data`, and then it can be further used in other functions, like `determine_executor_actions`
 2. market order book can be accessed by `market_data_provider.get_order_book()` function, the order book object can be refer in hummingbot.core.data_type.order_book from /Users/hanwencheng/Projects/hummingbot/hummingbot/core/data_type
 3. check the CloseType in /Users/hanwencheng/Projects/hummingbot-api/venv/lib/python3.12/site-packages/hummingbot/strategy_v2/models/executors.py, for different states of the order.
+4. use      result = self.market_data_provider.get_volume_for_price(
+                self.config.connector_name,
+                self.config.trading_pair,
+                float(price),
+                is_buy
+            )
+            volume = Decimal(str(result.query_volume))
+   to get the order book volume
+
+
+## Executor info lookup optimization:
+
+Question: the _update_executor_states and _is_order_filled always loop all the executors, but as the strategy running, there might be a very huge executor list, is there any way to 
+optimize? 
+
+detail in /Users/hanwencheng/Projects/hummingbot-api/.claude/executor-optimization-plan.md
+
 
 ## 🤖 Method 1: MCP Server (Recommended)
 

@@ -29,7 +29,7 @@ from hummingbot.strategy_v2.controllers.controller_base import ControllerBase, C
 from hummingbot.strategy_v2.executors.data_types import ConnectorPair
 from hummingbot.strategy_v2.executors.order_executor.data_types import ExecutionStrategy, OrderExecutorConfig
 from hummingbot.strategy_v2.models.executor_actions import CreateExecutorAction, ExecutorAction, StopExecutorAction
-
+from hummingbot.strategy_v2.models.executors import CloseType, ExecutorInfo
 
 class HEIBTCMMConfig(ControllerConfigBase):
     """Configuration for HEI/BTC Market Making Strategy"""
@@ -284,31 +284,64 @@ class HEIBTCMMController(ControllerBase):
 
         return actions
 
-    def _update_executor_states(self):
-        """Update tracking of executor states based on executors_info"""
-        for executor in self.executors_info:
-            executor_id = executor.id
-            level_id = executor.custom_info.get("level_id", "")
+    def _get_executor_by_id(self, executor_id: str) -> Optional[ExecutorInfo]:
+        """Efficient lookup using generator - stops at first match"""
+        return next(
+            (e for e in self.executors_info if e.id == executor_id),
+            None
+        )
 
-            if level_id.startswith("active_sell_") and executor.is_trading:
-                self.sell_filled_amount = Decimal(str(executor.filled_amount_quote))
-                if executor.filled_amount_quote > 0:
-                    btc_received = Decimal(str(executor.filled_amount_quote))
-                    self.total_btc_from_sales += btc_received
-                    self._record_hourly_sell(Decimal(str(executor.amount)))
+    def _update_executor_states(self):
+        """Update tracking of executor states based on executors_info (optimized)"""
+        active_sell_executors = self.filter_executors(
+            self.executors_info,
+            lambda x: x.is_active and x.custom_info.get("level_id", "").startswith("active_sell_")
+        )
+
+        for executor in active_sell_executors:
+            executed_quote = Decimal("0")
+            executed_base = Decimal("0")
+
+            if hasattr(executor, '_order') and executor._order:
+                executed_quote = Decimal(str(getattr(executor._order, 'executed_amount_quote', Decimal("0"))))
+                executed_base = Decimal(str(getattr(executor._order, 'executed_amount_base', Decimal("0"))))
+
+            self.sell_filled_amount = executed_quote
+            if executed_quote > Decimal("0"):
+                self.total_btc_from_sales += executed_quote
+                self._record_hourly_sell(executed_base)
+                self.logger().info(f"[_update_executor_states] Sell filled: executed_quote={executed_quote}, executed_base={executed_base}")
 
     def _is_order_filled(self, order_id: Optional[str]) -> bool:
-        """Check if an order executor is filled"""
+        """Check if an order executor is filled by accessing the underlying TrackedOrder (optimized)"""
         if not order_id:
             return False
 
-        for executor in self.executors_info:
-            if executor.id == order_id:
-                is_filled = executor.filled_amount_quote > 0
-                self.logger().info(f"[_is_order_filled] order_id={order_id}, close_type={executor.close_type}, is_trading={executor.is_trading}, filled_amount_quote={executor.filled_amount_quote}, is_filled={is_filled}")
-                return is_filled
-        self.logger().info(f"[_is_order_filled] order_id={order_id} not found in executors_info")
-        return False
+        executor = self._get_executor_by_id(order_id)
+        if not executor:
+            self.logger().info(f"[_is_order_filled] order_id={order_id} not found in executors_info")
+            return False
+
+        is_filled = False
+
+        if hasattr(executor, '_order') and executor._order:
+            tracked_order = executor._order
+            executed_base = getattr(tracked_order, 'executed_amount_base', Decimal("0"))
+            order_is_filled = getattr(tracked_order, 'is_filled', False)
+
+            self.logger().info(f"[_is_order_filled] order_id={order_id}, executed_amount_base={executed_base}, is_filled={order_is_filled}, close_type={executor.close_type}")
+
+            if executed_base > Decimal("0"):
+                is_filled = True
+            elif order_is_filled:
+                is_filled = True
+        else:
+            self.logger().info(f"[_is_order_filled] order_id={order_id}, no _order attribute, close_type={executor.close_type}")
+
+        if executor.close_type == CloseType.POSITION_HOLD:
+            is_filled = True
+
+        return is_filled
 
     def _should_trigger_sell(self) -> bool:
         """Check if sell should be triggered based on volume at buy_1 price"""
@@ -321,13 +354,20 @@ class HEIBTCMMController(ControllerBase):
         return should_sell
 
     def _was_sell_filled_or_partial(self) -> bool:
-        """Check if active sell order was filled or partially filled"""
+        """Check if active sell order was filled or partially filled (optimized)"""
         if not self.active_sell_order_id:
             return False
 
-        for executor in self.executors_info:
-            if executor.id == self.active_sell_order_id:
-                return executor.filled_amount_quote > 0
+        executor = self._get_executor_by_id(self.active_sell_order_id)
+        if not executor:
+            return False
+
+        if hasattr(executor, '_order') and executor._order:
+            executed_base = getattr(executor._order, 'executed_amount_base', Decimal("0"))
+            if executed_base > Decimal("0"):
+                return True
+        if executor.close_type == CloseType.POSITION_HOLD:
+            return True
         return False
 
     def _random_amount(self) -> Decimal:
@@ -501,16 +541,16 @@ class HEIBTCMMController(ControllerBase):
         return actions
 
     def _cancel_order(self, order_id: Optional[str]) -> List[ExecutorAction]:
-        """Cancel an order by executor ID"""
+        """Cancel an order by executor ID (optimized)"""
         if not order_id:
             return []
 
-        for executor in self.executors_info:
-            if executor.id == order_id and executor.is_active:
-                return [StopExecutorAction(
-                    controller_id=self.config.id,
-                    executor_id=order_id
-                )]
+        executor = self._get_executor_by_id(order_id)
+        if executor and executor.is_active:
+            return [StopExecutorAction(
+                controller_id=self.config.id,
+                executor_id=order_id
+            )]
         return []
 
     def _check_hourly_limit(self, amount: Decimal) -> bool:
@@ -635,7 +675,7 @@ class HEIBTCMMController(ControllerBase):
                 float(price),
                 is_buy
             )
-            volume = Decimal(str(result.result_volume))
+            volume = Decimal(str(result.query_volume))
             self.logger().info(f"[_get_volume_at_price] price={price}, is_buy={is_buy}, volume={volume}")
             return volume
         except Exception as e:
