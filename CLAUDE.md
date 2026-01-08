@@ -2,6 +2,10 @@
 
 This guide shows you how to interact with the Hummingbot API using Claude (claude.ai) and Claude Code (CLI).
 
+## About Strategy Creation
+1. the market data has to be updated in `update_processed_data` function, this is the function to be called by every update circle. The market data is updated in `self.processed_data`, and then it can be further used in other functions, like `determine_executor_actions`
+2. market order book can be accessed by `market_data_provider.get_order_book()` function, the order book object can be refer in hummingbot.core.data_type.order_book from /Users/hanwencheng/Projects/hummingbot/hummingbot/core/data_type
+
 ## 🤖 Method 1: MCP Server (Recommended)
 
 The Hummingbot MCP server provides natural language access to all API functionality through Claude Desktop or Claude Code.

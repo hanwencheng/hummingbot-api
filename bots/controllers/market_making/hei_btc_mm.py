@@ -23,14 +23,14 @@ from typing import Dict, List, Optional
 
 from pydantic import Field
 
-from hummingbot.core.data_type.common import OrderType, TradeType
+from hummingbot.core.data_type.common import MarketDict, TradeType
+from hummingbot.core.data_type.order_book import OrderBook
 from hummingbot.data_feed.candles_feed.data_types import CandlesConfig
 from hummingbot.strategy_v2.controllers.controller_base import ControllerBase, ControllerConfigBase
 from hummingbot.strategy_v2.executors.data_types import ConnectorPair
 from hummingbot.strategy_v2.executors.order_executor.data_types import ExecutionStrategy, OrderExecutorConfig
 from hummingbot.strategy_v2.models.executor_actions import CreateExecutorAction, ExecutorAction, StopExecutorAction
 from hummingbot.strategy_v2.models.executors import CloseType
-from hummingbot.core.data_type.common import MarketDict
 
 
 class HEIBTCMMConfig(ControllerConfigBase):
@@ -203,13 +203,12 @@ class HEIBTCMMController(ControllerBase):
             self._load_state()
             self._state_loaded = True
 
-        order_book = self._get_order_book_snapshot()
-        if order_book is None:
-            self.logger().warning("Could not get order book data")
+        if not self.processed_data.get("order_book_valid", False):
+            self.logger().warning("Order book data not available in processed_data")
             return actions
 
-        sell_1_price = order_book["best_ask"]
-        buy_1_price = order_book["best_bid"]
+        sell_1_price = self.processed_data["best_ask"]
+        buy_1_price = self.processed_data["best_bid"]
         spread = sell_1_price - buy_1_price
         price_changed = (sell_1_price != self.last_sell_1_price)
 
@@ -228,9 +227,9 @@ class HEIBTCMMController(ControllerBase):
                 self.last_sell_1_price = sell_1_price
                 self.logger().info(f"BUY_1_ACTIVE -> BUY_2_ACTIVE: buy_1 filled, placing buy_2")
 
-            elif self._should_trigger_sell(order_book):
+            elif self._should_trigger_sell():
                 actions.extend(self._cancel_order(self.buy_1_order_id))
-                actions.extend(self._place_active_sell_order(order_book))
+                actions.extend(self._place_active_sell_order())
                 self.logger().info(f"BUY_1_ACTIVE -> SELL_ACTIVE: Volume threshold met, selling")
 
             elif price_changed and spread > self.config.min_tick:
@@ -285,31 +284,6 @@ class HEIBTCMMController(ControllerBase):
 
         return actions
 
-    def _get_order_book_snapshot(self) -> Optional[Dict]:
-        """Get current order book snapshot"""
-        try:
-            connector = self.connectors.get(self.config.connector_name)
-            if connector and hasattr(connector, 'get_order_book'):
-                order_book = connector.get_order_book(self.config.trading_pair)
-                best_bid = Decimal(str(order_book.get_price(False)))
-                best_ask = Decimal(str(order_book.get_price(True)))
-
-                def get_volume_at_price(price: Decimal, is_buy: bool = True) -> Decimal:
-                    try:
-                        result = order_book.get_volume_for_price(is_buy, float(price))
-                        return Decimal(str(result.result_volume))
-                    except Exception:
-                        return Decimal("0")
-
-                return {
-                    "best_bid": best_bid,
-                    "best_ask": best_ask,
-                    "volume_at_price": get_volume_at_price
-                }
-        except Exception as e:
-            self.logger().error(f"Error getting order book: {e}")
-        return None
-
     def _update_executor_states(self):
         """Update tracking of executor states based on executors_info"""
         for executor in self.executors_info:
@@ -335,12 +309,12 @@ class HEIBTCMMController(ControllerBase):
                 )
         return False
 
-    def _should_trigger_sell(self, order_book: Dict) -> bool:
+    def _should_trigger_sell(self) -> bool:
         """Check if sell should be triggered based on volume at buy_1 price"""
         if self.current_order_price <= Decimal("0"):
             return False
 
-        volume_at_price = order_book["volume_at_price"](self.current_order_price, True)
+        volume_at_price = self._get_volume_at_price(self.current_order_price, True)
         return volume_at_price >= self.config.market_sell_threshold
 
     def _was_sell_filled_or_partial(self) -> bool:
@@ -413,9 +387,9 @@ class HEIBTCMMController(ControllerBase):
 
         return [action]
 
-    def _place_active_sell_order(self, order_book: Dict) -> List[ExecutorAction]:
+    def _place_active_sell_order(self) -> List[ExecutorAction]:
         """Place market sell order when volume threshold is met"""
-        volume_at_price = order_book["volume_at_price"](self.current_order_price, True)
+        volume_at_price = self._get_volume_at_price(self.current_order_price, True)
         sell_amount = volume_at_price / Decimal("2")
 
         if not self._check_hourly_limit(sell_amount):
@@ -601,12 +575,60 @@ class HEIBTCMMController(ControllerBase):
             self.logger().error(f"Error loading state: {e}")
 
     async def update_processed_data(self):
-        """Update processed data (required by base class)"""
+        """Update processed data including order book snapshot (called every cycle)"""
+        order_book_data = self._fetch_order_book_data()
+
         self.processed_data = {
             "current_state": self.current_state,
             "total_btc_from_sales": self.total_btc_from_sales,
-            "timestamp": self.market_data_provider.time()
+            "timestamp": self.market_data_provider.time(),
+            "order_book_valid": order_book_data is not None,
+            "best_bid": order_book_data["best_bid"] if order_book_data else Decimal("0"),
+            "best_ask": order_book_data["best_ask"] if order_book_data else Decimal("0"),
+            "order_book": order_book_data["order_book"] if order_book_data else None
         }
+
+    def _fetch_order_book_data(self) -> Optional[Dict]:
+        """Fetch order book data from connector"""
+        try:
+            connector = self.connectors.get(self.config.connector_name)
+            if connector is None:
+                self.logger().warning(f"Connector {self.config.connector_name} not found")
+                return None
+
+            if not hasattr(connector, 'get_order_book'):
+                self.logger().warning(f"Connector {self.config.connector_name} does not support get_order_book")
+                return None
+
+            order_book: OrderBook = connector.get_order_book(self.config.trading_pair)
+            if order_book is None:
+                self.logger().warning(f"Order book not available for {self.config.trading_pair}")
+                return None
+
+            best_bid = Decimal(str(order_book.get_price(False)))
+            best_ask = Decimal(str(order_book.get_price(True)))
+
+            return {
+                "best_bid": best_bid,
+                "best_ask": best_ask,
+                "order_book": order_book
+            }
+        except Exception as e:
+            self.logger().error(f"Error fetching order book: {e}")
+            return None
+
+    def _get_volume_at_price(self, price: Decimal, is_buy: bool = True) -> Decimal:
+        """Get cumulative volume at a specific price level from order book"""
+        order_book: Optional[OrderBook] = self.processed_data.get("order_book")
+        if order_book is None:
+            return Decimal("0")
+
+        try:
+            result = order_book.get_volume_for_price(is_buy, float(price))
+            return Decimal(str(result.result_volume))
+        except Exception as e:
+            self.logger().debug(f"Error getting volume at price {price}: {e}")
+            return Decimal("0")
 
     def to_format_status(self) -> List[str]:
         """Get formatted status for display"""
@@ -617,6 +639,13 @@ class HEIBTCMMController(ControllerBase):
         status.append("=" * len(header))
 
         status.append(f"State: {self.current_state}")
+
+        if self.processed_data.get("order_book_valid", False):
+            status.append(f"Best bid: {self.processed_data.get('best_bid', 'N/A')}")
+            status.append(f"Best ask: {self.processed_data.get('best_ask', 'N/A')}")
+        else:
+            status.append("Order book: Not available")
+
         status.append(f"Last sell_1 price: {self.last_sell_1_price}")
         status.append(f"Current order price: {self.current_order_price}")
         status.append("")
