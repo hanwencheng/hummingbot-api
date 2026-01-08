@@ -5,6 +5,7 @@ This guide shows you how to interact with the Hummingbot API using Claude (claud
 ## About Strategy Creation
 1. the market data has to be updated in `update_processed_data` function, this is the function to be called by every update circle. The market data is updated in `self.processed_data`, and then it can be further used in other functions, like `determine_executor_actions`
 2. market order book can be accessed by `market_data_provider.get_order_book()` function, the order book object can be refer in hummingbot.core.data_type.order_book from /Users/hanwencheng/Projects/hummingbot/hummingbot/core/data_type
+3. check the CloseType in /Users/hanwencheng/Projects/hummingbot-api/venv/lib/python3.12/site-packages/hummingbot/strategy_v2/models/executors.py, for different states of the order.
 
 ## 🤖 Method 1: MCP Server (Recommended)
 

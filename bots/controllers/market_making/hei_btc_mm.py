@@ -24,13 +24,11 @@ from typing import Dict, List, Optional
 from pydantic import Field
 
 from hummingbot.core.data_type.common import MarketDict, TradeType
-from hummingbot.core.data_type.order_book import OrderBook
 from hummingbot.data_feed.candles_feed.data_types import CandlesConfig
 from hummingbot.strategy_v2.controllers.controller_base import ControllerBase, ControllerConfigBase
 from hummingbot.strategy_v2.executors.data_types import ConnectorPair
 from hummingbot.strategy_v2.executors.order_executor.data_types import ExecutionStrategy, OrderExecutorConfig
 from hummingbot.strategy_v2.models.executor_actions import CreateExecutorAction, ExecutorAction, StopExecutorAction
-from hummingbot.strategy_v2.models.executors import CloseType
 
 
 class HEIBTCMMConfig(ControllerConfigBase):
@@ -212,6 +210,8 @@ class HEIBTCMMController(ControllerBase):
         spread = sell_1_price - buy_1_price
         price_changed = (sell_1_price != self.last_sell_1_price)
 
+        self.logger().info(f"[determine_executor_actions] state={self.current_state}, sell_1={sell_1_price}, buy_1={buy_1_price}, spread={spread}, price_changed={price_changed}")
+
         self._update_executor_states()
 
         if self.current_state == self.STATES["INITIAL"]:
@@ -304,9 +304,10 @@ class HEIBTCMMController(ControllerBase):
 
         for executor in self.executors_info:
             if executor.id == order_id:
-                return executor.close_type == CloseType.FILLED or (
-                    executor.is_trading and executor.filled_amount_quote > 0
-                )
+                is_filled = executor.filled_amount_quote > 0
+                self.logger().info(f"[_is_order_filled] order_id={order_id}, close_type={executor.close_type}, is_trading={executor.is_trading}, filled_amount_quote={executor.filled_amount_quote}, is_filled={is_filled}")
+                return is_filled
+        self.logger().info(f"[_is_order_filled] order_id={order_id} not found in executors_info")
         return False
 
     def _should_trigger_sell(self) -> bool:
@@ -315,7 +316,9 @@ class HEIBTCMMController(ControllerBase):
             return False
 
         volume_at_price = self._get_volume_at_price(self.current_order_price, True)
-        return volume_at_price >= self.config.market_sell_threshold
+        should_sell = volume_at_price >= self.config.market_sell_threshold
+        self.logger().info(f"[_should_trigger_sell] volume_at_price={volume_at_price}, threshold={self.config.market_sell_threshold}, should_sell={should_sell}")
+        return should_sell
 
     def _was_sell_filled_or_partial(self) -> bool:
         """Check if active sell order was filled or partially filled"""
@@ -337,6 +340,7 @@ class HEIBTCMMController(ControllerBase):
         """Place buy_1 order: 1 tick below best ask"""
         price = sell_1_price - self.config.min_tick
         amount = self._random_amount()
+        self.logger().info(f"[_place_buy_1_order] sell_1_price={sell_1_price}, order_price={price}, amount={amount}")
 
         executor_config = OrderExecutorConfig(
             timestamp=self.market_data_provider.time(),
@@ -364,6 +368,7 @@ class HEIBTCMMController(ControllerBase):
         """Place buy_2 order: 2 ticks below best ask"""
         price = sell_1_price - (2 * self.config.min_tick)
         amount = self._random_amount()
+        self.logger().info(f"[_place_buy_2_order] sell_1_price={sell_1_price}, order_price={price}, amount={amount}")
 
         executor_config = OrderExecutorConfig(
             timestamp=self.market_data_provider.time(),
@@ -391,9 +396,10 @@ class HEIBTCMMController(ControllerBase):
         """Place market sell order when volume threshold is met"""
         volume_at_price = self._get_volume_at_price(self.current_order_price, True)
         sell_amount = volume_at_price / Decimal("2")
+        self.logger().info(f"[_place_active_sell_order] volume_at_price={volume_at_price}, sell_amount={sell_amount}")
 
         if not self._check_hourly_limit(sell_amount):
-            self.logger().warning(f"Hourly sell limit exceeded, skipping sell")
+            self.logger().warning(f"[_place_active_sell_order] Hourly sell limit exceeded, skipping sell")
             return []
 
         executor_config = OrderExecutorConfig(
@@ -420,6 +426,7 @@ class HEIBTCMMController(ControllerBase):
     def _place_followup_buy_order(self) -> List[ExecutorAction]:
         """Place followup market buy order after sell (Design #7)"""
         amount = self._random_amount()
+        self.logger().info(f"[_place_followup_buy_order] amount={amount}")
 
         executor_config = OrderExecutorConfig(
             timestamp=self.market_data_provider.time(),
@@ -584,50 +591,55 @@ class HEIBTCMMController(ControllerBase):
             "timestamp": self.market_data_provider.time(),
             "order_book_valid": order_book_data is not None,
             "best_bid": order_book_data["best_bid"] if order_book_data else Decimal("0"),
-            "best_ask": order_book_data["best_ask"] if order_book_data else Decimal("0"),
-            "order_book": order_book_data["order_book"] if order_book_data else None
+            "best_ask": order_book_data["best_ask"] if order_book_data else Decimal("0")
         }
 
+        if order_book_data:
+            self.logger().info(f"[update_processed_data] best_bid={order_book_data['best_bid']}, best_ask={order_book_data['best_ask']}")
+        else:
+            self.logger().info("[update_processed_data] Order book data NOT available")
+
     def _fetch_order_book_data(self) -> Optional[Dict]:
-        """Fetch order book data from connector"""
+        """Fetch order book data from market_data_provider"""
         try:
-            connector = self.connectors.get(self.config.connector_name)
-            if connector is None:
-                self.logger().warning(f"Connector {self.config.connector_name} not found")
-                return None
+            self.logger().info(f"[_fetch_order_book_data] Fetching order book for {self.config.connector_name}:{self.config.trading_pair}")
 
-            if not hasattr(connector, 'get_order_book'):
-                self.logger().warning(f"Connector {self.config.connector_name} does not support get_order_book")
-                return None
+            order_book = self.market_data_provider.get_order_book(
+                self.config.connector_name,
+                self.config.trading_pair
+            )
 
-            order_book: OrderBook = connector.get_order_book(self.config.trading_pair)
             if order_book is None:
-                self.logger().warning(f"Order book not available for {self.config.trading_pair}")
+                self.logger().info(f"[_fetch_order_book_data] Order book is None for {self.config.trading_pair}")
                 return None
 
             best_bid = Decimal(str(order_book.get_price(False)))
             best_ask = Decimal(str(order_book.get_price(True)))
 
+            self.logger().info(f"[_fetch_order_book_data] Success: best_bid={best_bid}, best_ask={best_ask}")
+
             return {
                 "best_bid": best_bid,
-                "best_ask": best_ask,
-                "order_book": order_book
+                "best_ask": best_ask
             }
         except Exception as e:
-            self.logger().error(f"Error fetching order book: {e}")
+            self.logger().error(f"[_fetch_order_book_data] Error fetching order book: {e}")
             return None
 
     def _get_volume_at_price(self, price: Decimal, is_buy: bool = True) -> Decimal:
-        """Get cumulative volume at a specific price level from order book"""
-        order_book: Optional[OrderBook] = self.processed_data.get("order_book")
-        if order_book is None:
-            return Decimal("0")
-
+        """Get cumulative volume at a specific price level from market_data_provider"""
         try:
-            result = order_book.get_volume_for_price(is_buy, float(price))
-            return Decimal(str(result.result_volume))
+            result = self.market_data_provider.get_volume_for_price(
+                self.config.connector_name,
+                self.config.trading_pair,
+                float(price),
+                is_buy
+            )
+            volume = Decimal(str(result.result_volume))
+            self.logger().info(f"[_get_volume_at_price] price={price}, is_buy={is_buy}, volume={volume}")
+            return volume
         except Exception as e:
-            self.logger().debug(f"Error getting volume at price {price}: {e}")
+            self.logger().info(f"[_get_volume_at_price] Error getting volume at price {price}: {e}")
             return Decimal("0")
 
     def to_format_status(self) -> List[str]:
