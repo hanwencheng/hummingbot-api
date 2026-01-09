@@ -233,6 +233,7 @@ class HEIBTCMMController(ControllerBase):
 
             elif self._should_trigger_sell(buy_1_price, spread):
                 actions.extend(self._cancel_order(self.buy_1_order_id))
+                self.buy_1_order_id = None  # Don't track anymore
                 actions.extend(self._place_active_sell_order(buy_1_price))
                 self.logger().info(f"BUY_1_ACTIVE -> SELL_ACTIVE: Volume threshold met, selling")
 
