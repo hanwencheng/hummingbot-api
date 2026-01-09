@@ -14,6 +14,8 @@ This guide shows you how to interact with the Hummingbot API using Claude (claud
             )
             volume = Decimal(str(result.query_volume))
    to get the order book volume
+     - is_buy=True → queries ASK side (orders you'd buy FROM)
+     - is_buy=False → queries BID side (orders you'd sell TO)
 
 
 ## Executor info lookup optimization:

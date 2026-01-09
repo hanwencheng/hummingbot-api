@@ -29,7 +29,8 @@ from hummingbot.strategy_v2.controllers.controller_base import ControllerBase, C
 from hummingbot.strategy_v2.executors.data_types import ConnectorPair
 from hummingbot.strategy_v2.executors.order_executor.data_types import ExecutionStrategy, OrderExecutorConfig
 from hummingbot.strategy_v2.models.executor_actions import CreateExecutorAction, ExecutorAction, StopExecutorAction
-from hummingbot.strategy_v2.models.executors import CloseType, ExecutorInfo
+from hummingbot.strategy_v2.models.executors import CloseType
+from hummingbot.strategy_v2.models.executors_info import ExecutorInfo
 
 class HEIBTCMMConfig(ControllerConfigBase):
     """Configuration for HEI/BTC Market Making Strategy"""
@@ -348,16 +349,28 @@ class HEIBTCMMController(ControllerBase):
 
     def _should_trigger_sell(self, best_bid: Decimal, spread: Decimal) -> bool:
         """Check if sell should be triggered based on volume at best bid when spread is minimum"""
-        if spread > self.config.min_tick:
-            return False
+        try:
+            if spread > self.config.min_tick:
+                return False
 
-        if best_bid <= Decimal("0"):
-            return False
+            if best_bid <= Decimal("0"):
+                return False
 
-        volume_at_bid = self._get_volume_at_price(best_bid, True)
-        should_sell = volume_at_bid >= self.config.market_sell_threshold
-        self.logger().info(f"[_should_trigger_sell] best_bid={best_bid}, spread={spread}, volume={volume_at_bid}, threshold={self.config.market_sell_threshold}, should_sell={should_sell}")
-        return should_sell
+            volume_at_bid = self._get_volume_at_price(best_bid, is_buy=False)
+            threshold = self.config.market_sell_threshold
+
+            self.logger().info(f"[_should_trigger_sell] volume_at_bid type={type(volume_at_bid)}, value={volume_at_bid}")
+            self.logger().info(f"[_should_trigger_sell] threshold type={type(threshold)}, value={threshold}")
+
+            if volume_at_bid <= Decimal("0"):
+                return False
+
+            should_sell = volume_at_bid >= threshold
+            self.logger().info(f"[_should_trigger_sell] best_bid={best_bid}, spread={spread}, volume={volume_at_bid}, threshold={threshold}, should_sell={should_sell}")
+            return should_sell
+        except Exception as e:
+            self.logger().error(f"[_should_trigger_sell] Error: {e}")
+            return False
 
     def _was_sell_filled_or_partial(self) -> bool:
         """Check if active sell order was filled or partially filled (optimized)"""
@@ -440,7 +453,7 @@ class HEIBTCMMController(ControllerBase):
 
     def _place_active_sell_order(self, best_bid: Decimal) -> List[ExecutorAction]:
         """Place market sell order when volume threshold is met at best bid"""
-        volume_at_bid = self._get_volume_at_price(best_bid, True)
+        volume_at_bid = self._get_volume_at_price(best_bid, is_buy=False)
         sell_amount = volume_at_bid / Decimal("2")
         self.logger().info(f"[_place_active_sell_order] best_bid={best_bid}, volume_at_bid={volume_at_bid}, sell_amount={sell_amount}")
 
@@ -672,18 +685,18 @@ class HEIBTCMMController(ControllerBase):
             self.logger().error(f"[_fetch_order_book_data] Error fetching order book: {e}")
             return None
 
-    def _get_volume_at_price(self, price: Decimal, is_buy: bool = True) -> Decimal:
-        """Get cumulative volume at a specific price level from market_data_provider"""
+    def _get_volume_at_price(self, price: Decimal, is_buy: bool = False) -> Decimal:
+        """Get cumulative volume at a specific price level using connector directly (like VWAP script)"""
         try:
-            result = self.market_data_provider.get_volume_for_price(
-                self.config.connector_name,
+            connector = self.market_data_provider.get_connector(self.config.connector_name)
+            result = connector.get_volume_for_price(
                 self.config.trading_pair,
-                float(price),
-                is_buy
+                is_buy,
+                price
             )
-            volume = Decimal(str(result.query_volume))
+            volume = result.result_volume
             self.logger().info(f"[_get_volume_at_price] price={price}, is_buy={is_buy}, volume={volume}")
-            return volume
+            return volume if volume else Decimal("0")
         except Exception as e:
             self.logger().info(f"[_get_volume_at_price] Error getting volume at price {price}: {e}")
             return Decimal("0")
