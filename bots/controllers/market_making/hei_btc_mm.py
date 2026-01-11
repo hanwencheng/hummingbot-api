@@ -136,14 +136,6 @@ class HEIBTCMMConfig(ControllerConfigBase):
     )
 
     state_file_name: str = Field(default="hei_btc_mm_state.json")
-    debug_logging_enabled: bool = Field(
-        default=True,
-        json_schema_extra={
-            "prompt": "Enable debug logging:",
-            "prompt_on_new": False,
-            "is_updatable": True
-        }
-    )
 
     def update_markets(self, markets: MarketDict) -> MarketDict:
         return markets.add_or_update(self.connector_name, self.trading_pair)
@@ -201,9 +193,11 @@ class HEIBTCMMController(ControllerBase):
         self._state_loaded = False
         self.processed_data = {}
 
+        self.debug_logging_enabled: bool = True
+        self.buy_only_enabled: bool = True
+
     def _log_debug(self, message: str):
-        """Log debug message only if debug_logging_enabled is True"""
-        if self.config.debug_logging_enabled:
+        if self.debug_logging_enabled:
             self.logger().info(message)
 
     def determine_executor_actions(self) -> List[ExecutorAction]:
@@ -307,34 +301,28 @@ class HEIBTCMMController(ControllerBase):
         return actions
 
     def _get_executor_by_id(self, executor_id: str) -> Optional[ExecutorInfo]:
-        """Efficient lookup using generator - stops at first match"""
-        return next(
-            (e for e in self.executors_info if e.id == executor_id),
-            None
-        )
+        return next((e for e in self.executors_info if e.id == executor_id), None)
 
     def _has_executed_amount(self, executor: ExecutorInfo) -> bool:
-        """Check if executor has any executed amount"""
         if hasattr(executor, '_order') and executor._order:
-            executed_base = getattr(executor._order, 'executed_amount_base', Decimal("0"))
-            return executed_base > Decimal("0")
+            return getattr(executor._order, 'executed_amount_base', Decimal("0")) > Decimal("0")
         return False
 
+    def _get_executor_amounts(self, executor: ExecutorInfo) -> tuple[Decimal, Decimal]:
+        if hasattr(executor, '_order') and executor._order:
+            quote = Decimal(str(getattr(executor._order, 'executed_amount_quote', Decimal("0"))))
+            base = Decimal(str(getattr(executor._order, 'executed_amount_base', Decimal("0"))))
+            return quote, base
+        return Decimal("0"), Decimal("0")
+
     def _update_executor_states(self):
-        """Update tracking of executor states based on executors_info (optimized)"""
         active_sell_executors = self.filter_executors(
             self.executors_info,
             lambda x: x.is_active and x.custom_info.get("level_id", "").startswith("active_sell_")
         )
 
         for executor in active_sell_executors:
-            executed_quote = Decimal("0")
-            executed_base = Decimal("0")
-
-            if hasattr(executor, '_order') and executor._order:
-                executed_quote = Decimal(str(getattr(executor._order, 'executed_amount_quote', Decimal("0"))))
-                executed_base = Decimal(str(getattr(executor._order, 'executed_amount_base', Decimal("0"))))
-
+            executed_quote, executed_base = self._get_executor_amounts(executor)
             self.sell_filled_amount = executed_quote
             if executed_quote > Decimal("0"):
                 self.total_btc_from_sales += executed_quote
@@ -342,7 +330,6 @@ class HEIBTCMMController(ControllerBase):
                 self._log_debug(f"[_update_executor_states] Sell filled: executed_quote={executed_quote}, executed_base={executed_base}")
 
     def _is_order_filled(self, order_id: Optional[str]) -> bool:
-        """Check if an order executor is filled by accessing the underlying TrackedOrder (optimized)"""
         if not order_id:
             return False
 
@@ -351,158 +338,121 @@ class HEIBTCMMController(ControllerBase):
             self._log_debug(f"[_is_order_filled] order_id={order_id} not found in executors_info")
             return False
 
-        is_filled = False
+        if executor.close_type == CloseType.POSITION_HOLD:
+            return True
 
         if hasattr(executor, '_order') and executor._order:
             tracked_order = executor._order
             executed_base = getattr(tracked_order, 'executed_amount_base', Decimal("0"))
             order_is_filled = getattr(tracked_order, 'is_filled', False)
-
             self._log_debug(f"[_is_order_filled] order_id={order_id}, executed_amount_base={executed_base}, is_filled={order_is_filled}, close_type={executor.close_type}")
+            return executed_base > Decimal("0") or order_is_filled
 
-            is_filled = executed_base > Decimal("0") or order_is_filled
-        else:
-            self._log_debug(f"[_is_order_filled] order_id={order_id}, no _order attribute, close_type={executor.close_type}")
-
-        if executor.close_type == CloseType.POSITION_HOLD:
-            is_filled = True
-
-        return is_filled
+        self._log_debug(f"[_is_order_filled] order_id={order_id}, no _order attribute, close_type={executor.close_type}")
+        return False
 
     def _should_trigger_sell(self, best_bid: Decimal, spread: Decimal) -> bool:
-        """Check if sell should be triggered based on volume at best bid when spread is minimum"""
-        try:
-            if spread > self.config.min_tick:
-                return False
+        if self.buy_only_enabled:
+            return False
 
-            if best_bid <= Decimal("0"):
+        try:
+            if spread > self.config.min_tick or best_bid <= Decimal("0"):
                 return False
 
             volume_at_bid = self._get_volume_at_price(best_bid, is_buy=False)
-            threshold = self.config.market_sell_threshold
-
             if volume_at_bid <= Decimal("0"):
                 return False
 
-            should_sell = volume_at_bid >= threshold
-            self._log_debug(f"[_should_trigger_sell] best_bid={best_bid}, spread={spread}, volume={volume_at_bid}, threshold={threshold}, should_sell={should_sell}")
+            should_sell = volume_at_bid >= self.config.market_sell_threshold
+            self._log_debug(f"[_should_trigger_sell] best_bid={best_bid}, spread={spread}, volume={volume_at_bid}, threshold={self.config.market_sell_threshold}, should_sell={should_sell}")
             return should_sell
         except Exception as e:
             self.logger().error(f"[_should_trigger_sell] Error: {e}")
             return False
 
     def _was_sell_filled_or_partial(self) -> bool:
-        """Check if active sell order was filled or partially filled"""
         if not self.active_sell_order_id:
             return False
-
         executor = self._get_executor_by_id(self.active_sell_order_id)
         if not executor:
             return False
-
         return self._has_executed_amount(executor) or executor.close_type == CloseType.POSITION_HOLD
 
     def _random_amount(self) -> Decimal:
-        """Generate random order amount between min and max size"""
-        min_size = float(self.config.buy_order_min_size)
-        max_size = float(self.config.buy_order_max_size)
-        return Decimal(str(round(random.uniform(min_size, max_size), 2)))
+        return Decimal(str(round(random.uniform(
+            float(self.config.buy_order_min_size),
+            float(self.config.buy_order_max_size)
+        ), 2)))
 
-    def _create_limit_buy_order(self, price: Decimal, level_id: str) -> OrderExecutorConfig:
-        """Create a limit buy order executor config"""
+    def _create_order_config(self, side: TradeType, amount: Decimal, price: Decimal,
+                             strategy: ExecutionStrategy, level_id: str) -> OrderExecutorConfig:
         return OrderExecutorConfig(
             timestamp=self.market_data_provider.time(),
             connector_name=self.config.connector_name,
             trading_pair=self.config.trading_pair,
-            side=TradeType.BUY,
-            amount=self._random_amount(),
+            side=side,
+            amount=amount,
             price=price,
-            execution_strategy=ExecutionStrategy.LIMIT,
+            execution_strategy=strategy,
             level_id=level_id
         )
 
-    def _place_buy_1_order(self, sell_1_price: Decimal) -> List[ExecutorAction]:
-        """Place buy_1 order: 1 tick below best ask"""
-        price = sell_1_price - self.config.min_tick
-        self._log_debug(f"[_place_buy_1_order] sell_1_price={sell_1_price}, order_price={price}")
+    def _create_executor_action(self, config: OrderExecutorConfig) -> CreateExecutorAction:
+        return CreateExecutorAction(controller_id=self.config.id, executor_config=config)
 
-        executor_config = self._create_limit_buy_order(price, f"buy_1_{int(time.time())}")
-        self.buy_1_order_id = executor_config.id
+    def _place_buy_order(self, sell_1_price: Decimal, ticks: int, order_type: str) -> List[ExecutorAction]:
+        price = sell_1_price - (ticks * self.config.min_tick)
+        self._log_debug(f"[_place_{order_type}_order] sell_1_price={sell_1_price}, order_price={price}")
+
+        level_id = f"{order_type}_{int(time.time())}"
+        executor_config = self._create_order_config(TradeType.BUY, self._random_amount(), price,
+                                                    ExecutionStrategy.LIMIT, level_id)
+
+        if order_type == "buy_1":
+            self.buy_1_order_id = executor_config.id
+            self.current_state = self.STATES["BUY_1_ACTIVE"]
+        else:
+            self.buy_2_order_id = executor_config.id
+            self.current_state = self.STATES["BUY_2_ACTIVE"]
+
         self.current_order_price = price
-        self.current_state = self.STATES["BUY_1_ACTIVE"]
+        return [self._create_executor_action(executor_config)]
 
-        return [CreateExecutorAction(controller_id=self.config.id, executor_config=executor_config)]
+    def _place_buy_1_order(self, sell_1_price: Decimal) -> List[ExecutorAction]:
+        return self._place_buy_order(sell_1_price, 1, "buy_1")
 
     def _place_buy_2_order(self, sell_1_price: Decimal) -> List[ExecutorAction]:
-        """Place buy_2 order: 2 ticks below best ask"""
-        price = sell_1_price - (2 * self.config.min_tick)
-        self._log_debug(f"[_place_buy_2_order] sell_1_price={sell_1_price}, order_price={price}")
-
-        executor_config = self._create_limit_buy_order(price, f"buy_2_{int(time.time())}")
-        self.buy_2_order_id = executor_config.id
-        self.current_order_price = price
-        self.current_state = self.STATES["BUY_2_ACTIVE"]
-
-        return [CreateExecutorAction(controller_id=self.config.id, executor_config=executor_config)]
+        return self._place_buy_order(sell_1_price, 2, "buy_2")
 
     def _place_active_sell_order(self, best_bid: Decimal) -> List[ExecutorAction]:
-        """Place market sell order when volume threshold is met at best bid"""
         volume_at_bid = self._get_volume_at_price(best_bid, is_buy=False)
-        sell_amount = volume_at_bid / Decimal("2")
+        sell_amount = volume_at_bid / Decimal("4")
         self._log_debug(f"[_place_active_sell_order] best_bid={best_bid}, volume_at_bid={volume_at_bid}, sell_amount={sell_amount}")
 
         if not self._check_hourly_limit(sell_amount):
-            self.logger().warning(f"[_place_active_sell_order] Hourly sell limit exceeded, skipping sell")
+            self.logger().warning("[_place_active_sell_order] Hourly sell limit exceeded, skipping sell")
             return []
 
-        executor_config = OrderExecutorConfig(
-            timestamp=self.market_data_provider.time(),
-            connector_name=self.config.connector_name,
-            trading_pair=self.config.trading_pair,
-            side=TradeType.SELL,
-            amount=sell_amount,
-            price=best_bid,
-            execution_strategy=ExecutionStrategy.MARKET,
-            level_id=f"active_sell_{int(time.time())}"
+        executor_config = self._create_order_config(
+            TradeType.SELL, sell_amount, best_bid,
+            ExecutionStrategy.MARKET, f"active_sell_{int(time.time())}"
         )
-
-        action = CreateExecutorAction(
-            controller_id=self.config.id,
-            executor_config=executor_config
-        )
-
         self.active_sell_order_id = executor_config.id
         self.current_state = self.STATES["SELL_ACTIVE"]
-
-        return [action]
+        return [self._create_executor_action(executor_config)]
 
     def _place_followup_buy_order(self) -> List[ExecutorAction]:
-        """Place followup market buy order after sell (Design #7)"""
         amount = self._random_amount()
         self._log_debug(f"[_place_followup_buy_order] amount={amount}")
 
-        executor_config = OrderExecutorConfig(
-            timestamp=self.market_data_provider.time(),
-            connector_name=self.config.connector_name,
-            trading_pair=self.config.trading_pair,
-            side=TradeType.BUY,
-            amount=amount,
-            price=Decimal("0"),
-            execution_strategy=ExecutionStrategy.MARKET,
-            level_id=f"followup_buy_{int(time.time())}"
+        executor_config = self._create_order_config(
+            TradeType.BUY, amount, Decimal("0"),
+            ExecutionStrategy.MARKET, f"followup_buy_{int(time.time())}"
         )
-
-        action = CreateExecutorAction(
-            controller_id=self.config.id,
-            executor_config=executor_config
-        )
-
         self.followup_buy_order_id = executor_config.id
-
-        return [action]
+        return [self._create_executor_action(executor_config)]
 
     def _update_deep_orders(self, buy_1_price: Decimal) -> List[ExecutorAction]:
-        """Update deep buy orders to build order book depth (Design #6)"""
         actions = []
 
         for order_id in self.deep_order_ids:
@@ -510,40 +460,22 @@ class HEIBTCMMController(ControllerBase):
         self.deep_order_ids.clear()
 
         available_btc = self.total_btc_from_sales * self.config.deep_order_btc_ratio
-        starting_price = buy_1_price - (self.config.deep_order_start_offset * self.config.min_tick)
-
-        current_price = starting_price
+        current_price = buy_1_price - (self.config.deep_order_start_offset * self.config.min_tick)
         level_index = 0
 
         while available_btc > Decimal("0") and current_price > Decimal("0"):
             max_hei = self.config.deep_order_max_per_level
             btc_needed = max_hei * current_price
-
-            if btc_needed > available_btc:
-                hei_amount = available_btc / current_price
-            else:
-                hei_amount = max_hei
+            hei_amount = available_btc / current_price if btc_needed > available_btc else max_hei
 
             if hei_amount < Decimal("1"):
                 break
 
-            executor_config = OrderExecutorConfig(
-                timestamp=self.market_data_provider.time(),
-                connector_name=self.config.connector_name,
-                trading_pair=self.config.trading_pair,
-                side=TradeType.BUY,
-                amount=hei_amount,
-                price=current_price,
-                execution_strategy=ExecutionStrategy.LIMIT,
-                level_id=f"deep_buy_{level_index}_{int(time.time())}"
+            executor_config = self._create_order_config(
+                TradeType.BUY, hei_amount, current_price,
+                ExecutionStrategy.LIMIT, f"deep_buy_{level_index}_{int(time.time())}"
             )
-
-            action = CreateExecutorAction(
-                controller_id=self.config.id,
-                executor_config=executor_config
-            )
-
-            actions.append(action)
+            actions.append(self._create_executor_action(executor_config))
             self.deep_order_ids.append(executor_config.id)
 
             available_btc -= hei_amount * current_price
@@ -554,45 +486,35 @@ class HEIBTCMMController(ControllerBase):
         return actions
 
     def _cancel_order(self, order_id: Optional[str]) -> List[ExecutorAction]:
-        """Cancel an order by executor ID (optimized)"""
         if not order_id:
             return []
-
         executor = self._get_executor_by_id(order_id)
         if executor and executor.is_active:
-            return [StopExecutorAction(
-                controller_id=self.config.id,
-                executor_id=order_id
-            )]
+            return [StopExecutorAction(controller_id=self.config.id, executor_id=order_id)]
         return []
 
     def _get_current_hour(self) -> int:
-        """Get current hour timestamp (floored to hour boundary)"""
         return int(self.market_data_provider.time() // 3600) * 3600
 
+    def _get_hourly_sold(self) -> Decimal:
+        return self.hourly_sell_amounts.get(self._get_current_hour(), Decimal("0"))
+
     def _check_hourly_limit(self, amount: Decimal) -> bool:
-        """Check if sell amount would exceed hourly limit (Design #5)"""
-        current_hour = self._get_current_hour()
-        current_sold = self.hourly_sell_amounts.get(current_hour, Decimal("0"))
-        return (current_sold + amount) <= self.config.hourly_sell_limit
+        return (self._get_hourly_sold() + amount) <= self.config.hourly_sell_limit
 
     def _record_hourly_sell(self, amount: Decimal):
-        """Record sell amount for hourly tracking"""
         current_hour = self._get_current_hour()
-        self.hourly_sell_amounts[current_hour] = self.hourly_sell_amounts.get(current_hour, Decimal("0")) + amount
-
+        self.hourly_sell_amounts[current_hour] = self._get_hourly_sold() + amount
         cutoff = current_hour - 86400
         self.hourly_sell_amounts = {h: v for h, v in self.hourly_sell_amounts.items() if h >= cutoff}
 
     def _get_state_file_path(self) -> str:
-        """Get path to state file"""
         base_path = os.path.dirname(os.path.dirname(os.path.dirname(__file__)))
         data_dir = os.path.join(base_path, "instances", "data")
         os.makedirs(data_dir, exist_ok=True)
         return os.path.join(data_dir, self.config.state_file_name)
 
     def _save_state(self):
-        """Save strategy state to file (Design #8)"""
         try:
             state = {
                 "current_state": self.current_state,
@@ -605,87 +527,72 @@ class HEIBTCMMController(ControllerBase):
                 "last_deep_order_sell_1_price": str(self.last_deep_order_sell_1_price),
                 "last_updated": time.time()
             }
-            state_path = self._get_state_file_path()
-            with open(state_path, 'w') as f:
+            with open(self._get_state_file_path(), 'w') as f:
                 json.dump(state, f, indent=2)
         except Exception as e:
             self.logger().error(f"Error saving state: {e}")
 
     def _load_state(self):
-        """Load strategy state from file"""
         try:
             state_path = self._get_state_file_path()
-            if os.path.exists(state_path):
-                with open(state_path, 'r') as f:
-                    state = json.load(f)
+            if not os.path.exists(state_path):
+                return
 
-                    self.current_state = state.get("current_state", self.STATES["INITIAL"])
-                    self.last_sell_1_price = Decimal(state.get("last_sell_1_price", "0"))
-                    self.buy_1_fill_time = state.get("buy_1_fill_time", 0)
-                    self.current_order_price = Decimal(state.get("current_order_price", "0"))
-                    self.hourly_sell_amounts = {
-                        int(k): Decimal(v) for k, v in state.get("hourly_sell_amounts", {}).items()
-                    }
-                    self.total_btc_from_sales = Decimal(state.get("total_btc_from_sales", "0"))
-                    self.last_deep_order_update_time = state.get("last_deep_order_update_time", 0)
-                    self.last_deep_order_sell_1_price = Decimal(state.get("last_deep_order_sell_1_price", "0"))
+            with open(state_path, 'r') as f:
+                state = json.load(f)
 
-                    self.current_state = self.STATES["INITIAL"]
+            self.last_sell_1_price = Decimal(state.get("last_sell_1_price", "0"))
+            self.buy_1_fill_time = state.get("buy_1_fill_time", 0)
+            self.current_order_price = Decimal(state.get("current_order_price", "0"))
+            self.hourly_sell_amounts = {int(k): Decimal(v) for k, v in state.get("hourly_sell_amounts", {}).items()}
+            self.total_btc_from_sales = Decimal(state.get("total_btc_from_sales", "0"))
+            self.last_deep_order_update_time = state.get("last_deep_order_update_time", 0)
+            self.last_deep_order_sell_1_price = Decimal(state.get("last_deep_order_sell_1_price", "0"))
+            self.current_state = self.STATES["INITIAL"]
 
-                    self._log_debug(f"Loaded state: total_btc_from_sales={self.total_btc_from_sales}")
+            self._log_debug(f"Loaded state: total_btc_from_sales={self.total_btc_from_sales}")
         except Exception as e:
             self.logger().error(f"Error loading state: {e}")
 
     async def update_processed_data(self):
-        """Update processed data including order book snapshot (called every cycle)"""
         order_book_data = self._fetch_order_book_data()
+        is_valid = order_book_data is not None
 
         self.processed_data = {
             "current_state": self.current_state,
             "total_btc_from_sales": self.total_btc_from_sales,
             "timestamp": self.market_data_provider.time(),
-            "order_book_valid": order_book_data is not None,
-            "best_bid": order_book_data["best_bid"] if order_book_data else Decimal("0"),
-            "best_ask": order_book_data["best_ask"] if order_book_data else Decimal("0")
+            "order_book_valid": is_valid,
+            "best_bid": order_book_data["best_bid"] if is_valid else Decimal("0"),
+            "best_ask": order_book_data["best_ask"] if is_valid else Decimal("0")
         }
 
-        if order_book_data:
+        if is_valid:
             self._log_debug(f"[update_processed_data] best_bid={order_book_data['best_bid']}, best_ask={order_book_data['best_ask']}")
         else:
             self._log_debug("[update_processed_data] Order book data NOT available")
 
     def _fetch_order_book_data(self) -> Optional[Dict]:
-        """Fetch order book data from market_data_provider"""
         try:
             order_book = self.market_data_provider.get_order_book(
-                self.config.connector_name,
-                self.config.trading_pair
+                self.config.connector_name, self.config.trading_pair
             )
-
             if order_book is None:
                 self._log_debug(f"[_fetch_order_book_data] Order book is None for {self.config.trading_pair}")
                 return None
 
-            best_bid = Decimal(str(order_book.get_price(False)))
-            best_ask = Decimal(str(order_book.get_price(True)))
-
             return {
-                "best_bid": best_bid,
-                "best_ask": best_ask
+                "best_bid": Decimal(str(order_book.get_price(False))),
+                "best_ask": Decimal(str(order_book.get_price(True)))
             }
         except Exception as e:
             self.logger().error(f"[_fetch_order_book_data] Error fetching order book: {e}")
             return None
 
     def _get_volume_at_price(self, price: Decimal, is_buy: bool = False) -> Decimal:
-        """Get cumulative volume at a specific price level using connector directly (like VWAP script)"""
         try:
             connector = self.market_data_provider.get_connector(self.config.connector_name)
-            result = connector.get_volume_for_price(
-                self.config.trading_pair,
-                is_buy,
-                price
-            )
+            result = connector.get_volume_for_price(self.config.trading_pair, is_buy, price)
             volume = result.result_volume
             self._log_debug(f"[_get_volume_at_price] price={price}, is_buy={is_buy}, volume={volume}")
             return volume if volume else Decimal("0")
@@ -694,28 +601,23 @@ class HEIBTCMMController(ControllerBase):
             return Decimal("0")
 
     def to_format_status(self) -> List[str]:
-        """Get formatted status for display"""
-        status = []
-
         header = f"HEI/BTC MM | {self.config.connector_name}:{self.config.trading_pair}"
-        status.append(header)
-        status.append("=" * len(header))
-
-        status.append(f"State: {self.current_state}")
+        status = [header, "=" * len(header), f"State: {self.current_state}"]
 
         if self.processed_data.get("order_book_valid", False):
-            status.append(f"Best bid: {self.processed_data.get('best_bid', 'N/A')}")
-            status.append(f"Best ask: {self.processed_data.get('best_ask', 'N/A')}")
+            status.extend([
+                f"Best bid: {self.processed_data.get('best_bid', 'N/A')}",
+                f"Best ask: {self.processed_data.get('best_ask', 'N/A')}"
+            ])
         else:
             status.append("Order book: Not available")
 
-        status.append(f"Last sell_1 price: {self.last_sell_1_price}")
-        status.append(f"Current order price: {self.current_order_price}")
-        status.append("")
-
-        hourly_sold = self.hourly_sell_amounts.get(self._get_current_hour(), Decimal("0"))
-        status.append(f"Hourly sold: {hourly_sold} / {self.config.hourly_sell_limit} HEI")
-        status.append(f"Total BTC from sales: {self.total_btc_from_sales}")
-        status.append(f"Deep orders: {len(self.deep_order_ids)}")
-
+        status.extend([
+            f"Last sell_1 price: {self.last_sell_1_price}",
+            f"Current order price: {self.current_order_price}",
+            "",
+            f"Hourly sold: {self._get_hourly_sold()} / {self.config.hourly_sell_limit} HEI",
+            f"Total BTC from sales: {self.total_btc_from_sales}",
+            f"Deep orders: {len(self.deep_order_ids)}"
+        ])
         return status
