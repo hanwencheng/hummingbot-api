@@ -137,6 +137,15 @@ class HEIBTCMMConfig(ControllerConfigBase):
 
     state_file_name: str = Field(default="hei_btc_mm_state.json")
 
+    buy_only_enabled: bool = Field(
+        default=True,
+        json_schema_extra={
+            "prompt": "Enable buy-only mode (disables selling):",
+            "prompt_on_new": True,
+            "is_updatable": True
+        }
+    )
+
     def update_markets(self, markets: MarketDict) -> MarketDict:
         return markets.add_or_update(self.connector_name, self.trading_pair)
 
@@ -194,7 +203,6 @@ class HEIBTCMMController(ControllerBase):
         self.processed_data = {}
 
         self.debug_logging_enabled: bool = True
-        self.buy_only_enabled: bool = True
 
     def _log_debug(self, message: str):
         if self.debug_logging_enabled:
@@ -352,7 +360,7 @@ class HEIBTCMMController(ControllerBase):
         return False
 
     def _should_trigger_sell(self, best_bid: Decimal, spread: Decimal) -> bool:
-        if self.buy_only_enabled:
+        if self.config.buy_only_enabled:
             return False
 
         try:
