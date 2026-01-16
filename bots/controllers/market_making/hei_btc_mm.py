@@ -23,6 +23,7 @@ from typing import Dict, List, Optional
 
 from pydantic import Field
 
+from hummingbot import data_path
 from hummingbot.core.data_type.common import MarketDict, TradeType
 from hummingbot.data_feed.candles_feed.data_types import CandlesConfig
 from hummingbot.strategy_v2.controllers.controller_base import ControllerBase, ControllerConfigBase
@@ -208,6 +209,10 @@ class HEIBTCMMController(ControllerBase):
         if self.debug_logging_enabled:
             self.logger().info(message)
 
+    def on_stop(self):
+        self._save_state()
+        self.logger().info("Controller stopped, state saved")
+
     def determine_executor_actions(self) -> List[ExecutorAction]:
         """Main strategy loop implementing the state machine"""
         actions = []
@@ -297,14 +302,12 @@ class HEIBTCMMController(ControllerBase):
         time_since_deep_update = current_time - self.last_deep_order_update_time
         deep_price_changed = (sell_1_price != self.last_deep_order_sell_1_price)
 
-        if (time_since_deep_update >= self.config.deep_buy_update_cooldown and
-            deep_price_changed and
-            self.total_btc_from_sales > Decimal("0")):
-            actions.extend(self._update_deep_orders(buy_1_price))
+        if time_since_deep_update >= self.config.deep_buy_update_cooldown:
+            if deep_price_changed and self.total_btc_from_sales > Decimal("0"):
+                actions.extend(self._update_deep_orders(buy_1_price))
+                self.last_deep_order_sell_1_price = sell_1_price
+            self._save_state()
             self.last_deep_order_update_time = current_time
-            self.last_deep_order_sell_1_price = sell_1_price
-
-        self._save_state()
 
         return actions
 
@@ -517,10 +520,7 @@ class HEIBTCMMController(ControllerBase):
         self.hourly_sell_amounts = {h: v for h, v in self.hourly_sell_amounts.items() if h >= cutoff}
 
     def _get_state_file_path(self) -> str:
-        base_path = os.path.dirname(os.path.dirname(os.path.dirname(__file__)))
-        data_dir = os.path.join(base_path, "instances", "data")
-        os.makedirs(data_dir, exist_ok=True)
-        return os.path.join(data_dir, self.config.state_file_name)
+        return os.path.join(data_path(), self.config.state_file_name)
 
     def _save_state(self):
         try:
@@ -535,15 +535,20 @@ class HEIBTCMMController(ControllerBase):
                 "last_deep_order_sell_1_price": str(self.last_deep_order_sell_1_price),
                 "last_updated": time.time()
             }
-            with open(self._get_state_file_path(), 'w') as f:
+            state_path = self._get_state_file_path()
+            with open(state_path, 'w') as f:
                 json.dump(state, f, indent=2)
+            self.logger().info(f"[STATE_PERSIST] === State saved to {state_path} ===")
+            self.logger().info(f"[STATE_PERSIST] total_btc_from_sales={self.total_btc_from_sales}, hourly_sold={self._get_hourly_sold()}")
         except Exception as e:
-            self.logger().error(f"Error saving state: {e}")
+            self.logger().error(f"[STATE_PERSIST] !!! Error saving state: {e}")
 
     def _load_state(self):
         try:
             state_path = self._get_state_file_path()
             if not os.path.exists(state_path):
+                self.logger().info(f"[STATE_PERSIST] === No state file found at {state_path}, creating with defaults ===")
+                self._save_state()
                 return
 
             with open(state_path, 'r') as f:
@@ -558,9 +563,10 @@ class HEIBTCMMController(ControllerBase):
             self.last_deep_order_sell_1_price = Decimal(state.get("last_deep_order_sell_1_price", "0"))
             self.current_state = self.STATES["INITIAL"]
 
-            self._log_debug(f"Loaded state: total_btc_from_sales={self.total_btc_from_sales}")
+            self.logger().info(f"[STATE_PERSIST] === State loaded from {state_path} ===")
+            self.logger().info(f"[STATE_PERSIST] total_btc_from_sales={self.total_btc_from_sales}, hourly_sold={self._get_hourly_sold()}")
         except Exception as e:
-            self.logger().error(f"Error loading state: {e}")
+            self.logger().error(f"[STATE_PERSIST] !!! Error loading state: {e}")
 
     async def update_processed_data(self):
         order_book_data = self._fetch_order_book_data()

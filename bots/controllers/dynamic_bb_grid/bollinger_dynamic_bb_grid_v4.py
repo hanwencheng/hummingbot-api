@@ -1,12 +1,27 @@
 """
 Bollinger Bands Dynamic BB-Grid Strategy V4
 
-Advanced Bollinger Bands strategy with dynamic grid management:
-- Signal-based entry level adjustment (signal + 2*profit_pct)
-- Keep filled levels, update unfilled levels on new signals
-- BUY signal when BBP < bb_long_threshold (oversold condition)
-- Dynamic level management with no cooldown
-- Final profit/stop loss with waiting period after stop loss
+The strategy automatically place orders with triple barrier method when there is oversold or overbought according to the bollingerband.
+
+The strategy will define standard stage, breakthrough stage and fallback stage according to the bollinger band.
+In breakthrough stage the strategy will follow the trend, in standard and fallback, the strategy will place the reverse order.
+
+Configurations
+    interval: the interval time for the technical indicators, like "2m"
+    bb_length: Bollinger band length
+    bb_std: the Bollinger Bands standard deviation
+    connector_name: the connector name (e.g., hyperliquid_perpetual)
+    trading_pair: the trading pair to trade on (e.g., BTC-USD)
+    level_number: the number of accumulation levels
+    level_size: the quote asset amount for each level
+    cooldown_time: the cooldown time in seconds after executing a signal (e.g., 300 for 5 minutes)
+    accumulate_pct: the percentage of the price(based on current price) between accumulation levels (e.g., 0.01 for 1%)
+    profit_pct: the percentage for profit taking (e.g., 0.02 for 2%)
+    stop_loss_pct: the percentage for stop loss (e.g., 0.015 for 1.5%)
+    time_limit_hours: the time limit for incomplete levels in hours (e.g., 1):
+    stop_loss_waiting_time_hours: the cold down time after stop loss in hours (e.g., 4)
+    leverage: the leverage to use for trading
+    reverse_skew: The skew multiplier for trend following order(e.g., 1.0 for equal spacing)
 """
 
 from decimal import Decimal

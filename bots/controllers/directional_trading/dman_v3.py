@@ -1,3 +1,19 @@
+"""
+simple DCA 
+
+Accumulate a position at multiple price levels at oversold/overbought(for buy/sell) according to Bollinger Band, then exit when targets are hit.
+
+- **Connector Name**: Select the trading platform or exchange.
+- **Trading Pair**: Choose the cryptocurrency trading pair.
+- **Leverage**: Set the leverage ratio. (Note: if you are using spot trading, set the leverage to 1)
+- **Total Amount (Quote Currency)**: Define the total amount you want to allocate for trading.
+- **Position Mode**: Choose between different position modes.
+- **Cooldown Time**: Set the cooldown period between trades.
+- **Executor Refresh Time**: Define how often the executors refresh.
+- **Buy/Sell Spread Distributions**: Configure the distribution of buy and sell spreads.
+- **Order Amounts**: Specify the percentages for buy and sell order amounts.
+- **Custom D-Man Maker V2 Settings**: Set specific parameters like top executor refresh time and activation bounds.
+"""
 import time
 from decimal import Decimal
 from typing import List, Optional, Tuple

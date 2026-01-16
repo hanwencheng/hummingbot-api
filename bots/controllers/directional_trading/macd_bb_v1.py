@@ -1,3 +1,29 @@
+"""
+
+The strategy use MACD and Bollinger to identify the oversold with bullish crossover and overbought with bearish crossover opportunities, and do automatical trade.
+
+Long entry: price is near/inside the lower Bollinger Band (bbp < bb_long_threshold), MACD histogram just turned positive (macdh > 0) while the MACD line is still below zero (macd < 0). That’s looking for bullish momentum kicking in from an oversold area (positive histogram crossover while MACD remains negative).
+Short entry: price is near/inside the upper Bollinger Band (bbp > bb_short_threshold), MACD histogram just turned negative (macdh < 0) while the MACD line is still above zero (macd > 0). That’s looking for bearish momentum kicking in from an overbought area (negative histogram crossover while MACD remains positive).
+
+- **Connector Name**: Select the trading platform or exchange.
+- **Trading Pair**: Choose the cryptocurrency trading pair.
+- **Leverage**: Set the leverage ratio. (Note: if you are using spot trading, set the leverage to 1)
+- **Total Amount (Quote Currency)**: Define the total amount you want to allocate for trading.
+- **Max Executors per Side**: Specify the maximum number of executors per side.
+- **Cooldown Time**: Set the cooldown period between trades.
+- **Position Mode**: Choose between different position modes.
+- **Candles Connector**: Select the data source for candlestick data.
+- **Candles Trading Pair**: Choose the trading pair for candlestick data.
+- **Interval**: Set the interval for candlestick data.
+- **Bollinger Bands Length**: Define the length of the Bollinger Bands.
+- **Standard Deviation Multiplier**: Set the standard deviation multiplier for the Bollinger Bands.
+- **Long Threshold**: Configure the threshold for long positions.
+- **Short Threshold**: Configure the threshold for short positions.
+- **MACD Fast**: Set the fast period for the MACD indicator.
+- **MACD Slow**: Set the slow period for the MACD indicator.
+- **MACD Signal**: Set the signal period for the MACD indicator.
+- **Risk Management**: Set parameters for stop loss, take profit, time limit, and trailing stop settings.
+"""
 from typing import List
 
 import pandas_ta as ta  # noqa: F401

@@ -1,12 +1,117 @@
 """
-Bollinger Bands Dynamic BB-Grid Strategy V4
+Bollinger Bands Dynamic BB-Grid Strategy V6
 
-Advanced Bollinger Bands strategy with dynamic grid management:
-- Signal-based entry level adjustment (signal + 2*profit_pct)
-- Keep filled levels, update unfilled levels on new signals
-- BUY signal when BBP < bb_long_threshold (oversold condition)
-- Dynamic level management with no cooldown
-- Final profit/stop loss with waiting period after stop loss
+The strategy automatically place orders with triple barrier method when there is oversold or overbought according to the bollingerband and MACD.
+
+The strategy will define standard stage, breakthrough stage and fallback stage according to the distance to bollinger band and MACD.
+In breakthrough stage the strategy will follow the trend, in standard and fallback, the strategy will place the reverse order.
+the order price will be adjusted according to the width of the bollinger band, it the bb is wide, the order will have a higher offset.
+
+Configurations
+    interval: the interval time for the technical indicators, like "2m"
+    connector_name: the connector name (e.g., hyperliquid_perpetual)
+    trading_pair: the trading pair to trade on (e.g., BTC-USD)
+    level_number: the number of accumulation levels
+    level_size: the quote asset amount for each level
+    cooldown_time: the cooldown time in seconds after executing a signal (e.g., 300 for 5 minutes)
+    accumulate_pct: the percentage of the price(based on current price) between accumulation levels (e.g., 0.01 for 1%)
+    profit_pct: the percentage for profit taking (e.g., 0.02 for 2%)
+    stop_loss_pct: the percentage for stop loss (e.g., 0.015 for 1.5%)
+    time_limit_hours: the time limit for incomplete levels in hours (e.g., 1):
+    stop_loss_waiting_time_hours: the cold down time after stop loss in hours (e.g., 4)
+    leverage: the leverage to use for trading
+    reverse_skew: The skew multiplier for trend following order(e.g., 1.0 for equal spacing)
+    normal_stage_bb: float = Field(
+        default=-0.05,
+        json_schema_extra={
+            "prompt": "Enter the Bollinger Bands standard deviation: ",
+            "prompt_on_new": True
+        }
+    )
+    normal_entry_normal: float = Field(
+        default=-0.005,
+        json_schema_extra={
+            "prompt": "Enter the Bollinger Bands standard deviation: ",
+            "prompt_on_new": True
+        }
+    )
+    normal_entry_follow: float = Field(
+        default=-0.01,
+        json_schema_extra={
+            "prompt": "Enter the Bollinger Bands standard deviation: ",
+            "prompt_on_new": True
+        }
+    )
+    normal_entry_anti: float = Field(
+        default=0,
+        json_schema_extra={
+            "prompt": "Enter the Bollinger Bands standard deviation: ",
+            "prompt_on_new": True
+        }
+    )
+    breakthrough_stage_bb: float = Field(
+        default=0.2,
+        json_schema_extra={
+            "prompt": "Enter the Bollinger Bands standard deviation: ",
+            "prompt_on_new": True
+        }
+    )
+    breakthrough_entry_normal: float = Field(
+        default=0.015,
+        json_schema_extra={
+            "prompt": "Enter the Bollinger Bands standard deviation: ",
+            "prompt_on_new": True
+        }
+    )
+    breakthrough_entry_follow: float = Field(
+        default=0.005,
+        json_schema_extra={
+            "prompt": "Enter the Bollinger Bands standard deviation: ",
+            "prompt_on_new": True
+        }
+    )
+    breakthrough_entry_anti: float = Field(
+        default=0.025,
+        json_schema_extra={
+            "prompt": "Enter the Bollinger Bands standard deviation: ",
+            "prompt_on_new": True
+        }
+    )    
+    fallback_stage_bb: float = Field(
+        default=0.3,
+        json_schema_extra={
+            "prompt": "Enter the Bollinger Bands standard deviation: ",
+            "prompt_on_new": True
+        }
+    )
+    fallback_entry_normal: float = Field(
+        default=0.025,
+        json_schema_extra={
+            "prompt": "Enter the Bollinger Bands standard deviation: ",
+            "prompt_on_new": True
+        }
+    )
+    fallback_entry_follow: float = Field(
+        default=0.025,
+        json_schema_extra={
+            "prompt": "Enter the Bollinger Bands standard deviation: ",
+            "prompt_on_new": True
+        }
+    )
+    fallback_entry_anti: float = Field(
+        default=0.025,
+        json_schema_extra={
+            "prompt": "Enter the Bollinger Bands standard deviation: ",
+            "prompt_on_new": True
+        }
+    )
+    macd_threshold: float = Field(
+        default=0.005,
+        json_schema_extra={
+            "prompt": "Enter the Bollinger Bands standard deviation: ",
+            "prompt_on_new": True
+        }
+    )        
 """
 
 from decimal import Decimal
@@ -154,7 +259,7 @@ class BollingerDynamicBBGridV6Controller(DynamicBBGridController):
         ]
         self.stage = BBStage(config.macd_threshold, bb_stage_thresholds_dict)
         self.config.controller_name = config.controller_name
-        self.max_records = self.config.bb_length + 50000 # Extra buffer for BB calculation
+        self.max_records = 10000 # Extra buffer for BB calculation
         # Set up candles config if not provided
         if len(self.config.candles_config) == 0:
             self.config.candles_config = [

@@ -1,3 +1,24 @@
+"""
+
+The strategy place several level entry order, and accordingly place exit orders. 
+
+It is a one-directional grid, user need to set the start price for entry and end price for exit.
+
+Besides the global take profit and stop loss, it also dynamically manage each order level with configurable take profit and stop loss settings.
+Every position opened by the strategy is automatically monitored to your risk parameters.
+It can be configured to move with the market trend, either up or down, letting you adapt the strategy to changing market conditions.
+
+Configure your grid parameters:
+- **Side**: Choose BUY or SELL for the grid.
+- **Start Price**: The price where the grid begins.
+- **End Price**: The price where the grid ends.
+- **Limit Price**: A price limit that will stop the strategy.
+- **Min Spread Between Orders**: Minimum price difference between orders.
+- **Min Order Amount (Quote)**: Minimum size for individual orders.
+- **Maximum Open Orders**: Maximum number of active orders in the grid.
+
+"""
+
 from decimal import Decimal
 from typing import List, Optional
 

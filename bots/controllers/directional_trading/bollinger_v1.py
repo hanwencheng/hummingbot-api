@@ -1,3 +1,29 @@
+"""
+Bollinger Bands Simple Strategy
+
+The strategy place the limit order when there is an oversold or overbought
+
+User input
+
+- **Connector Name**: Select the trading platform or exchange.
+- **Trading Pair**: Choose the cryptocurrency trading pair.
+- **Leverage**: Set the leverage ratio. (Note: if you are using spot trading, set the leverage to 1)
+- **Total Amount (Quote Currency)**: Define the total amount you want to allocate for trading.
+- **Max Executors per Side**: Specify the maximum number of executors per side.
+- **Cooldown Time**: Set the cooldown period between trades.
+- **Position Mode**: Choose between different position modes.
+- **Candles Connector**: Select the data source for candlestick data.
+- **Candles Trading Pair**: Choose the trading pair for candlestick data.
+- **Interval**: Set the interval for candlestick data.
+- **Bollinger Bands Length**: Define the length of the Bollinger Bands.
+- **Standard Deviation Multiplier**: Set the standard deviation multiplier for the Bollinger Bands.
+- **Long Threshold**: Configure the threshold for long positions.
+- **Short Threshold**: Configure the threshold for short positions.
+- **Risk Management**: Set parameters for stop loss, take profit, time limit, and trailing stop settings.
+
+
+"""
+
 from typing import List
 
 import pandas_ta as ta  # noqa: F401
