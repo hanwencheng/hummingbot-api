@@ -16,6 +16,16 @@ This guide shows you how to interact with the Hummingbot API using Claude (claud
    to get the order book volume
      - is_buy=True → queries ASK side (orders you'd buy FROM)
      - is_buy=False → queries BID side (orders you'd sell TO)
+5. **Controller Lifecycle - on_stop() may not be called**: The `on_stop()` method in controllers is called by `control_loop()` after the while loop exits, but `controller.stop()` just sets a termination event and returns immediately. If the process exits before the async task reaches `on_stop()`, cleanup code won't run. **Solution**: Override `stop()` instead of `on_stop()` for cleanup:
+   ```python
+   def stop(self):
+       self._save_state()  # Cleanup here - guaranteed to run
+       self.logger().info("Controller stopping, state saved")
+       super().stop()
+
+   def on_stop(self):
+       pass  # May not be called, don't rely on it
+   ```
 
 
 ## Executor info lookup optimization:
