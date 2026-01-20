@@ -107,11 +107,12 @@ class SignalManager:
     def is_paused(self, controller_name: str) -> bool:
         return controller_name in self.paused
 
-    def market_regime(self, strategy: Optional[str] = None) -> Optional[str]:
-        keys = [f"{t}:{strategy}" for t in ("BULLISH", "BEARISH", "NEUTRAL")] if strategy else ["BULLISH", "BEARISH", "NEUTRAL"]
-        for key in keys:
-            if key in self.states:
-                return self.states[key].get("signalType")
+    def market_regime(self, instance_id: Optional[str] = None) -> Optional[str]:
+        key = f"REGIME:{instance_id}" if instance_id else "REGIME"
+        if key in self.states:
+            return self.states[key].get("signalType")
+        if instance_id:
+            return self.market_regime(None)
         return None
 
     async def update(self, since: float = 0):

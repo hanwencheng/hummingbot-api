@@ -31,7 +31,7 @@ class HEISignalConfig(ControllerConfigBase):
 
     connector_name: str = Field(default="binance")
     trading_pair: str = Field(default="HEI-USDT")
-    signal_server_url: str = Field(default="http://localhost:8001")
+    signal_server_url: str = Field(default="http://host.docker.internal:8005")
     signal_user_id: str = Field(default="614270688")
     default_order_amount: Decimal = Field(default=Decimal("100"))
     event_ttl: int = Field(default=60)
