@@ -269,7 +269,6 @@ class HEIBTCSignalController(ControllerBase):
 
     def _is_buy_only_mode(self) -> bool:
         regime = self._manager.market_regime(self.config.id)
-        self.logger().info(f"Get regime is {regime}")
         if regime == "BULLISH":
             return True
         if regime in ("BEARISH", "NEUTRAL"):
