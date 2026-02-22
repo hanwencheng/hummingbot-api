@@ -1,5 +1,5 @@
 """
-HEI/BTC Market Making Strategy with Signal Control
+HEI/USDT Market Making Strategy with Signal Control
 
 Based on hei_btc_mm.py but adds SignalManager integration for:
 - Pause/resume control: When paused, the strategy stops placing new orders
@@ -34,26 +34,27 @@ class HEIBTCSignalConfig(ControllerConfigBase):
     candles_config: List[CandlesConfig] = []
 
     connector_name: str = Field(default="binance")
-    trading_pair: str = Field(default="HEI-BTC")
+    trading_pair: str = Field(default="HEI-USDT")
 
     signal_server_url: str = Field(default="http://host.docker.internal:8005")
     signal_user_id: str = Field(default="614270688")
 
     buy_order_min_size: Decimal = Field(default=Decimal("100"))
     buy_order_max_size: Decimal = Field(default=Decimal("200"))
-    min_tick: Decimal = Field(default=Decimal("0.00000001"))
+    min_tick: Decimal = Field(default=Decimal("0.0001"))
     new_order_cooldown: int = Field(default=300)
     deep_buy_update_cooldown: int = Field(default=30)
 
-    hourly_sell_limit: Decimal = Field(default=Decimal("20000"))
-    market_sell_threshold: Decimal = Field(default=Decimal("5000"))
+    hourly_sell_limit: Decimal = Field(default=Decimal("10000"))
+    market_sell_threshold: Decimal = Field(default=Decimal("1000"))
 
-    deep_order_start_offset: int = Field(default=20)
+    deep_order_start_offset: int = Field(default=50)
     deep_order_max_per_level: Decimal = Field(default=Decimal("20000"))
-    deep_order_btc_ratio: Decimal = Field(default=Decimal("0.5"))
+    deep_order_usdt_ratio: Decimal = Field(default=Decimal("0.5"))
 
-    state_file_name: str = Field(default="hei_btc_signal_state.json")
+    state_file_name: str = Field(default="hei_usdt_signal_state.json")
     default_buy_only: bool = Field(default=True, description="Default buy-only mode when no market regime signal")
+    min_sell_interval: int = Field(default=300, description="Minimum seconds between market sells")
 
     def update_markets(self, markets: MarketDict) -> MarketDict:
         return markets.add_or_update(self.connector_name, self.trading_pair)
@@ -90,7 +91,7 @@ class HEIBTCSignalController(ControllerBase):
         self.last_sell_1_price: Decimal = Decimal("0")
 
         self.hourly_sell_amounts: Dict[int, Decimal] = {}
-        self.total_btc_from_sales: Decimal = Decimal("0")
+        self.total_usdt_from_sales: Decimal = Decimal("0")
 
         self.deep_order_ids: List[str] = []
         self.last_deep_order_update_time: float = 0
@@ -98,6 +99,7 @@ class HEIBTCSignalController(ControllerBase):
 
         self.pending_followup_buy: bool = False
         self.sell_filled_amount: Decimal = Decimal("0")
+        self.last_market_sell_time: float = 0
 
         self._state_loaded = False
         self.processed_data = {}
@@ -217,7 +219,7 @@ class HEIBTCSignalController(ControllerBase):
         deep_price_changed = (sell_1_price != self.last_deep_order_sell_1_price)
 
         if time_since_deep_update >= self.config.deep_buy_update_cooldown:
-            if deep_price_changed and self.total_btc_from_sales > Decimal("0"):
+            if deep_price_changed and self.total_usdt_from_sales > Decimal("0"):
                 actions.extend(self._update_deep_orders(buy_1_price))
                 self.last_deep_order_sell_1_price = sell_1_price
             self._save_state()
@@ -250,7 +252,7 @@ class HEIBTCSignalController(ControllerBase):
             executed_quote, executed_base = self._get_executor_amounts(executor)
             self.sell_filled_amount = executed_quote
             if executed_quote > Decimal("0"):
-                self.total_btc_from_sales += executed_quote
+                self.total_usdt_from_sales += executed_quote
                 self._record_hourly_sell(executed_base)
 
     def _is_order_filled(self, order_id: Optional[str]) -> bool:
@@ -280,6 +282,9 @@ class HEIBTCSignalController(ControllerBase):
             return False
         try:
             if spread > self.config.min_tick or best_bid <= Decimal("0"):
+                return False
+            elapsed = self.market_data_provider.time() - self.last_market_sell_time
+            if elapsed < self.config.min_sell_interval:
                 return False
             volume_at_bid = self._get_volume_at_price(best_bid, is_buy=False)
             if volume_at_bid <= Decimal("0"):
@@ -352,6 +357,7 @@ class HEIBTCSignalController(ControllerBase):
             ExecutionStrategy.MARKET, f"active_sell_{int(time.time())}"
         )
         self.active_sell_order_id = executor_config.id
+        self.last_market_sell_time = self.market_data_provider.time()
         self.current_state = self.STATES["SELL_ACTIVE"]
         return [self._create_executor_action(executor_config)]
 
@@ -370,14 +376,14 @@ class HEIBTCSignalController(ControllerBase):
             actions.extend(self._cancel_order(order_id))
         self.deep_order_ids.clear()
 
-        available_btc = self.total_btc_from_sales * self.config.deep_order_btc_ratio
+        available_usdt = self.total_usdt_from_sales * self.config.deep_order_usdt_ratio
         current_price = buy_1_price - (self.config.deep_order_start_offset * self.config.min_tick)
         level_index = 0
 
-        while available_btc > Decimal("0") and current_price > Decimal("0"):
+        while available_usdt > Decimal("0") and current_price > Decimal("0"):
             max_hei = self.config.deep_order_max_per_level
-            btc_needed = max_hei * current_price
-            hei_amount = available_btc / current_price if btc_needed > available_btc else max_hei
+            usdt_needed = max_hei * current_price
+            hei_amount = available_usdt / current_price if usdt_needed > available_usdt else max_hei
 
             if hei_amount < Decimal("1"):
                 break
@@ -389,7 +395,7 @@ class HEIBTCSignalController(ControllerBase):
             actions.append(self._create_executor_action(executor_config))
             self.deep_order_ids.append(executor_config.id)
 
-            available_btc -= hei_amount * current_price
+            available_usdt -= hei_amount * current_price
             current_price -= self.config.min_tick
             level_index += 1
 
@@ -429,10 +435,11 @@ class HEIBTCSignalController(ControllerBase):
                 "buy_1_fill_time": self.buy_1_fill_time,
                 "current_order_price": str(self.current_order_price),
                 "hourly_sell_amounts": {str(k): str(v) for k, v in self.hourly_sell_amounts.items()},
-                "total_btc_from_sales": str(self.total_btc_from_sales),
+                "total_usdt_from_sales": str(self.total_usdt_from_sales),
                 "last_deep_order_update_time": self.last_deep_order_update_time,
                 "last_deep_order_sell_1_price": str(self.last_deep_order_sell_1_price),
                 "last_consumed_timestamp": self._sub.last_timestamp,
+                "last_market_sell_time": self.last_market_sell_time,
                 "last_updated": time.time()
             }
             with open(self._get_state_file_path(), 'w') as f:
@@ -454,10 +461,11 @@ class HEIBTCSignalController(ControllerBase):
             self.buy_1_fill_time = state.get("buy_1_fill_time", 0)
             self.current_order_price = Decimal(state.get("current_order_price", "0"))
             self.hourly_sell_amounts = {int(k): Decimal(v) for k, v in state.get("hourly_sell_amounts", {}).items()}
-            self.total_btc_from_sales = Decimal(state.get("total_btc_from_sales", "0"))
+            self.total_usdt_from_sales = Decimal(state.get("total_usdt_from_sales", "0"))
             self.last_deep_order_update_time = state.get("last_deep_order_update_time", 0)
             self.last_deep_order_sell_1_price = Decimal(state.get("last_deep_order_sell_1_price", "0"))
             self._sub.last_timestamp = state.get("last_consumed_timestamp", 0)
+            self.last_market_sell_time = state.get("last_market_sell_time", 0)
             self.current_state = self.STATES["INITIAL"]
 
             self.logger().info(f"State loaded, last_consumed_timestamp={self._sub.last_timestamp}")
@@ -478,7 +486,7 @@ class HEIBTCSignalController(ControllerBase):
         self.processed_data = {
             "current_state": self.current_state,
             "is_paused": self._sub.is_paused(),
-            "total_btc_from_sales": self.total_btc_from_sales,
+            "total_usdt_from_sales": self.total_usdt_from_sales,
             "timestamp": self.market_data_provider.time(),
             "order_book_valid": is_valid,
             "best_bid": order_book_data["best_bid"] if is_valid else Decimal("0"),
@@ -512,7 +520,7 @@ class HEIBTCSignalController(ControllerBase):
         is_paused = self._sub.is_paused()
         regime = self._manager.market_regime(self.config.id) or "DEFAULT"
         buy_only = self._is_buy_only_mode()
-        header = f"HEI/BTC Signal MM | {self.config.connector_name}:{self.config.trading_pair}"
+        header = f"HEI/USDT Signal MM | {self.config.connector_name}:{self.config.trading_pair}"
         status = [
             header,
             "=" * len(header),
@@ -529,7 +537,7 @@ class HEIBTCSignalController(ControllerBase):
 
         status.extend([
             f"Hourly sold: {self._get_hourly_sold()} / {self.config.hourly_sell_limit} HEI",
-            f"Total BTC from sales: {self.total_btc_from_sales}",
+            f"Total USDT from sales: {self.total_usdt_from_sales}",
             f"Deep orders: {len(self.deep_order_ids)}"
         ])
 
